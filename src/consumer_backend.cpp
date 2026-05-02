@@ -119,15 +119,21 @@ static void ShutdownSharedMemory()
 }
 
 // ── public API (called from capture.h) ────────────────────────────────────────
+// Capture_Init and Capture_Shutdown are defined HERE (consumer_backend.cpp) and
+// nowhere else.  capture.cpp intentionally does not define them to avoid the
+// LNK2005 "multiply defined symbol" error that occurs when both translation
+// units are linked into the same DLL.
 void Capture_Init()
 {
     CreateDirectoryA(g_DumpDir, nullptr);
     InitSharedMemory();
+    // capture.cpp has no init work; surfaces are created lazily on first Present.
 }
 
 void Capture_Shutdown()
 {
     ShutdownSharedMemory();
+    Capture_ReleaseSurfaces();  // free the D3D staging surfaces owned by capture.cpp
 }
 
 /**
