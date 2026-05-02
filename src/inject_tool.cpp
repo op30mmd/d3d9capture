@@ -20,6 +20,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cctype>
 
