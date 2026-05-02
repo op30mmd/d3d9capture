@@ -78,7 +78,7 @@ jobs:
         working-directory: src/bin
         shell: pwsh
         run: |
-          $files = @("d3d9capture.dll", "d3d9capture.lib", "inject_tool.exe", "shm_reader.exe")
+          $files = @("d3d9capture.dll", "inject_tool.exe", "shm_reader.exe")
           foreach ($f in $files) {
             if (-not (Test-Path $f)) {
               Write-Error "Expected output missing: $f"
@@ -95,7 +95,6 @@ jobs:
           name: d3d9capture-${{ matrix.arch }}
           path: |
             src/bin/d3d9capture.dll
-            src/bin/d3d9capture.lib
             src/bin/inject_tool.exe
             src/bin/shm_reader.exe
           if-no-files-found: error
