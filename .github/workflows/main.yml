@@ -60,7 +60,7 @@ jobs:
              /Fo:bin\ ^
              /Fe:bin\inject_tool.exe ^
              inject_tool.cpp ^
-             /link kernel32.lib user32.lib
+             /link kernel32.lib user32.lib advapi32.lib
 
       # ── 6. Build shm_reader.exe ────────────────────────────────────────────
       - name: Build shm_reader.exe
