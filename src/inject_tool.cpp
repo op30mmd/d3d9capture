@@ -16,6 +16,10 @@
  *    kernel-level or driver-based injector instead.
  */
 
+#pragma comment(lib, "kernel32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "advapi32.lib")  // OpenProcessToken, LookupPrivilegeValue, AdjustTokenPrivileges
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
