@@ -108,13 +108,11 @@ static bool EnsureSurface(IDirect3DDevice9* pDev, int idx,
     return true;
 }
 
-// ── public API ────────────────────────────────────────────────────────────────
-void Capture_Init()
-{
-    // Nothing to pre-allocate; device not known yet.
-}
-
-void Capture_Shutdown()
+// ── internal helper — called by consumer_backend.cpp's Capture_Shutdown() ────
+// Capture_Init() and Capture_Shutdown() are defined in consumer_backend.cpp so
+// there is exactly one definition of each across the DLL.  This helper lets the
+// consumer's Capture_Shutdown() free the D3D staging surfaces owned here.
+void Capture_ReleaseSurfaces()
 {
     g_Shutdown.store(true);
     std::lock_guard<std::mutex> lk(g_CapMtx);
