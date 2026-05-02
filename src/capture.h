@@ -2,24 +2,36 @@
 /**
  * capture.h  —  Frame capture interface
  *
- * Lifecycle called from dllmain.cpp:
- *   Capture_Init()       – one-time setup
- *   Capture_OnPresent()  – called every frame (inside hooked Present)
- *   Capture_OnPreReset() – release GPU resources before Reset
- *   Capture_OnPostReset()– re-create GPU resources after successful Reset
- *   Capture_Shutdown()   – cleanup
+ * Ownership model
+ * ───────────────
+ * Capture_Init / Capture_Shutdown are defined ONCE in consumer_backend.cpp.
+ * They own top-level setup/teardown, and must call Capture_ReleaseSurfaces()
+ * during shutdown to free the GPU staging surfaces owned by capture.cpp.
+ *
+ * Lifecycle (called from dllmain.cpp):
+ *   Capture_Init()            – consumer one-time setup (consumer_backend.cpp)
+ *   Capture_OnPresent()       – called every frame inside hooked Present
+ *   Capture_OnPreReset()      – releases staging surfaces before Reset
+ *   Capture_OnPostReset()     – surfaces re-created lazily on next Present
+ *   Capture_Shutdown()        – consumer teardown; must call Capture_ReleaseSurfaces()
+ *
+ * Internal helper (capture.cpp → called by consumer_backend.cpp):
+ *   Capture_ReleaseSurfaces() – releases the D3D staging surfaces
  */
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
 
-// ── public API ────────────────────────────────────────────────────────────────
+// ── public API (Capture_Init / Capture_Shutdown defined in consumer_backend.cpp)
 void Capture_Init();
 void Capture_OnPresent(IDirect3DDevice9* pDev);
 void Capture_OnPreReset();
 void Capture_OnPostReset(IDirect3DDevice9* pDev);
 void Capture_Shutdown();
+
+// ── internal helper implemented in capture.cpp, called by Capture_Shutdown() ──
+void Capture_ReleaseSurfaces();
 
 // ── frame descriptor handed to the consumer backend ──────────────────────────
 struct FrameData
