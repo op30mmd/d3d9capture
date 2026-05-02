@@ -1,0 +1,144 @@
+name: Build d3d9capture
+
+on:
+  push:
+    branches: ["main", "master"]
+    paths:
+      - "src/**"
+      - ".github/workflows/build.yml"
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch:   # allow manual trigger from the Actions tab
+
+# Build both x86 (32-bit, targets most D3D9 games) and x64 in parallel.
+jobs:
+  build:
+    name: ${{ matrix.arch == 'x86' && '32-bit (x86)' || '64-bit (x64)' }}
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86, x64]   # produces d3d9capture-x86/ and d3d9capture-x64/ artifacts
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Set up MSVC environment ─────────────────────────────────────────
+      # ilammy/msvc-dev-cmd runs vcvarsall.bat and exports all the compiler
+      # environment variables (PATH, INCLUDE, LIB, …) into subsequent steps.
+      - name: Set up MSVC (${{ matrix.arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}   # "x86" → vcvars32, "x64" → vcvars64
+
+      # ── 3. Create output directory ─────────────────────────────────────────
+      - name: Create bin directory
+        run: mkdir -p bin
+        working-directory: src
+        shell: bash
+
+      # ── 4. Build d3d9capture.dll ───────────────────────────────────────────
+      - name: Build d3d9capture.dll
+        working-directory: src
+        shell: cmd
+        run: |
+          cl /nologo /W3 /WX /O2 /MD /LD ^
+             /Fo:bin\ ^
+             /Fe:bin\d3d9capture.dll ^
+             dllmain.cpp capture.cpp consumer_backend.cpp ^
+             /link d3d9.lib user32.lib gdi32.lib kernel32.lib
+
+      # ── 5. Build inject_tool.exe ───────────────────────────────────────────
+      - name: Build inject_tool.exe
+        working-directory: src
+        shell: cmd
+        run: |
+          cl /nologo /W3 /WX /O2 /MT ^
+             /Fo:bin\ ^
+             /Fe:bin\inject_tool.exe ^
+             inject_tool.cpp ^
+             /link kernel32.lib user32.lib
+
+      # ── 6. Build shm_reader.exe ────────────────────────────────────────────
+      - name: Build shm_reader.exe
+        working-directory: src
+        shell: cmd
+        run: |
+          cl /nologo /W3 /WX /O2 /MT ^
+             /Fo:bin\ ^
+             /Fe:bin\shm_reader.exe ^
+             shm_reader.cpp ^
+             /link kernel32.lib
+
+      # ── 7. Verify outputs exist ────────────────────────────────────────────
+      - name: Verify outputs
+        working-directory: src/bin
+        shell: pwsh
+        run: |
+          $files = @("d3d9capture.dll", "d3d9capture.lib", "inject_tool.exe", "shm_reader.exe")
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) {
+              Write-Error "Expected output missing: $f"
+              exit 1
+            }
+            $size = (Get-Item $f).Length
+            Write-Host "OK  $f  ($size bytes)"
+          }
+
+      # ── 8. Upload artifacts ────────────────────────────────────────────────
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3d9capture-${{ matrix.arch }}
+          path: |
+            src/bin/d3d9capture.dll
+            src/bin/d3d9capture.lib
+            src/bin/inject_tool.exe
+            src/bin/shm_reader.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  # ── Release job: runs only on version tags ──────────────────────────────────
+  # Push a tag like "v1.2.3" to trigger a GitHub Release with both
+  # x86 and x64 binaries attached as zipped assets.
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write   # needed to create the release
+
+    steps:
+      - name: Download x86 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: d3d9capture-x86
+          path: release/x86
+
+      - name: Download x64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: d3d9capture-x64
+          path: release/x64
+
+      - name: Zip artifacts
+        run: |
+          cd release
+          zip -r d3d9capture-${{ github.ref_name }}-x86.zip x86/
+          zip -r d3d9capture-${{ github.ref_name }}-x64.zip x64/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+          generate_release_notes: true
+          files: |
+            release/d3d9capture-${{ github.ref_name }}-x86.zip
+            release/d3d9capture-${{ github.ref_name }}-x64.zip
