@@ -35,6 +35,28 @@
 
 #include "capture.h"
 
+#include <cstdio>
+#include <cstdarg>
+
+// ── logging ──────────────────────────────────────────────────────────────────
+void Log(const char* fmt, ...)
+{
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    OutputDebugStringA(buf);
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, "C:\\d3d9capture\\debug.log", "a") == 0 && f)
+    {
+        fprintf(f, "%s\n", buf);
+        fclose(f);
+    }
+}
+
 // ── vtable slot indices ───────────────────────────────────────────────────────
 static constexpr int VT_D3D9_CREATEDEVICE    = 16; // IDirect3D9::CreateDevice
 static constexpr int VT_D3D9_CREATEDEVICEEX  = 20; // IDirect3D9Ex::CreateDeviceEx
@@ -95,6 +117,8 @@ static HRESULT WINAPI Hooked_Present(
     IDirect3DDevice9* pDev,
     const RECT* pSrc, const RECT* pDst, HWND hWnd, const RGNDATA* pDirty)
 {
+    static bool logged = false;
+    if (!logged) { Log("[dll] Hooked_Present called (first time)"); logged = true; }
     Capture_OnPresent(pDev);
     return g_OrigPresent(pDev, pSrc, pDst, hWnd, pDirty);
 }
@@ -102,6 +126,7 @@ static HRESULT WINAPI Hooked_Present(
 static HRESULT WINAPI Hooked_Reset(
     IDirect3DDevice9* pDev, D3DPRESENT_PARAMETERS* pPP)
 {
+    Log("[dll] Hooked_Reset called");
     Capture_OnPreReset();
     HRESULT hr = g_OrigReset(pDev, pPP);
     if (SUCCEEDED(hr))
@@ -113,6 +138,8 @@ static HRESULT WINAPI Hooked_PresentEx(
     IDirect3DDevice9Ex* pDev,
     const RECT* pSrc, const RECT* pDst, HWND hWnd, const RGNDATA* pDirty, DWORD Flags)
 {
+    static bool logged = false;
+    if (!logged) { Log("[dll] Hooked_PresentEx called (first time)"); logged = true; }
     Capture_OnPresent(pDev);
     return g_OrigPresentEx(pDev, pSrc, pDst, hWnd, pDirty, Flags);
 }
@@ -120,6 +147,7 @@ static HRESULT WINAPI Hooked_PresentEx(
 static HRESULT WINAPI Hooked_ResetEx(
     IDirect3DDevice9Ex* pDev, D3DPRESENT_PARAMETERS* pPP, D3DDISPLAYMODEEX* pMode)
 {
+    Log("[dll] Hooked_ResetEx called");
     Capture_OnPreReset();
     HRESULT hr = g_OrigResetEx(pDev, pPP, pMode);
     if (SUCCEEDED(hr))
@@ -131,6 +159,8 @@ static void InstallDeviceHooks(IDirect3DDevice9* pDev, bool bIsEx)
 {
     std::lock_guard<std::mutex> lk(g_HookMtx);
     if (g_DeviceHooked.load()) return;
+
+    Log("[dll] Installing device hooks (bIsEx=%d) ...", bIsEx);
 
     void** vtbl = *reinterpret_cast<void***>(pDev);
     bool ok = true;
@@ -148,7 +178,14 @@ static void InstallDeviceHooks(IDirect3DDevice9* pDev, bool bIsEx)
     }
 
     if (ok)
+    {
+        Log("[dll] Device hooks installed successfully");
         g_DeviceHooked.store(true);
+    }
+    else
+    {
+        Log("[dll] FAILED to install device hooks");
+    }
 }
 
 // ── IDirect3D9::CreateDevice hook ─────────────────────────────────────────────
@@ -162,6 +199,7 @@ static HRESULT WINAPI Hooked_CreateDevice(
     D3DPRESENT_PARAMETERS*  pPP,
     IDirect3DDevice9**      ppDevice)
 {
+    Log("[dll] Hooked_CreateDevice called");
     HRESULT hr = g_OrigCreateDevice(
         pD3D, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPP, ppDevice);
 
@@ -181,6 +219,7 @@ static HRESULT WINAPI Hooked_CreateDeviceEx(
     D3DDISPLAYMODEEX*       pOutMode,
     IDirect3DDevice9**      ppDevice)
 {
+    Log("[dll] Hooked_CreateDeviceEx called");
     HRESULT hr = g_OrigCreateDeviceEx(
         pD3D, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPP, pOutMode, ppDevice);
 
@@ -198,6 +237,8 @@ static void HookDirect3D9Factory()
 {
     typedef HRESULT (WINAPI *PFN_Direct3DCreate9Ex)(UINT, IDirect3D9Ex**);
 
+    Log("[dll] HookDirect3D9Factory() ...");
+
     // Load d3d9.dll if not already loaded (it always is in a D3D9 game).
     HMODULE hD3D9 = GetModuleHandleA("d3d9.dll");
     if (!hD3D9) hD3D9 = LoadLibraryA("d3d9.dll");
@@ -211,6 +252,7 @@ static void HookDirect3D9Factory()
         IDirect3D9Ex* pD3DEx = nullptr;
         if (SUCCEEDED(pfnCreateEx(D3D_SDK_VERSION, &pD3DEx)) && pD3DEx)
         {
+            Log("[dll] Hooking IDirect3D9Ex vtable ...");
             void** vtbl = *reinterpret_cast<void***>(pD3DEx);
             PatchVTable(&vtbl[VT_D3D9_CREATEDEVICE],   (void*)Hooked_CreateDevice,
                         (void**)&g_OrigCreateDevice);
@@ -231,6 +273,7 @@ static void HookDirect3D9Factory()
     IDirect3D9* pD3D = pfnCreate(D3D_SDK_VERSION);
     if (!pD3D) return;
 
+    Log("[dll] Hooking IDirect3D9 vtable ...");
     // Patch CreateDevice on the shared IDirect3D9 vtable.
     void** vtbl = *reinterpret_cast<void***>(pD3D);
     PatchVTable(&vtbl[VT_D3D9_CREATEDEVICE], (void*)Hooked_CreateDevice,
@@ -242,6 +285,7 @@ static void HookDirect3D9Factory()
 // ── worker thread ─────────────────────────────────────────────────────────────
 static DWORD WINAPI WorkerThread(LPVOID)
 {
+    Log("[dll] WorkerThread started");
     // Brief delay so d3d9.dll is mapped before we query it.
     // We don't need to wait for the game's device — our CreateDevice hook
     // will fire on the game's own thread at the right moment.
@@ -259,11 +303,13 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
     switch (reason)
     {
     case DLL_PROCESS_ATTACH:
+        Log("[dll] DllMain(DLL_PROCESS_ATTACH)");
         DisableThreadLibraryCalls(hInst);
         CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
         break;
 
     case DLL_PROCESS_DETACH:
+        Log("[dll] DllMain(DLL_PROCESS_DETACH)");
         Capture_Shutdown();
         break;
     }

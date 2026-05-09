@@ -98,16 +98,27 @@ static bool WriteBmp(const char* path, const FrameData& f)
 // ── shared-memory init/shutdown ───────────────────────────────────────────────
 static void InitSharedMemory()
 {
+    Log("[shm] InitSharedMemory ...");
     g_hMapping = CreateFileMappingA(
         INVALID_HANDLE_VALUE, nullptr,
         PAGE_READWRITE, 0, SHM_MAX_BYTES, SHM_NAME);
-    if (!g_hMapping) return;
+    if (!g_hMapping)
+    {
+        Log("[shm] CreateFileMappingA failed: %lu", GetLastError());
+        return;
+    }
 
     g_pView = MapViewOfFile(g_hMapping, FILE_MAP_WRITE, 0, 0, 0);
+    if (!g_pView)
+    {
+        Log("[shm] MapViewOfFile failed: %lu", GetLastError());
+        return;
+    }
 
     // Events for producer/consumer synchronisation.
     g_hEvtReady = CreateEventA(nullptr, FALSE, FALSE, EVT_FRAME_READY);
     g_hEvtDone  = CreateEventA(nullptr, FALSE, TRUE,  EVT_FRAME_DONE);
+    Log("[shm] Shared memory initialized");
 }
 
 static void ShutdownSharedMemory()
@@ -125,6 +136,7 @@ static void ShutdownSharedMemory()
 // units are linked into the same DLL.
 void Capture_Init()
 {
+    Log("[con] Capture_Init");
     CreateDirectoryA(g_DumpDir, nullptr);
     InitSharedMemory();
     // capture.cpp has no init work; surfaces are created lazily on first Present.
@@ -142,6 +154,9 @@ void Capture_Shutdown()
  */
 void Capture_FrameReady(const FrameData& f)
 {
+    static bool logged = false;
+    if (!logged) { Log("[con] Capture_FrameReady called (first time)"); logged = true; }
+
     // ── 1. Shared memory delivery ─────────────────────────────────────────
     if (g_pView && g_hEvtDone)
     {
