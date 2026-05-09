@@ -81,6 +81,7 @@ static bool EnsureSurface(IDirect3DDevice9* pDev, int idx,
 
     ReleaseSurface(s);
 
+    Log("[cap] Creating staging surface %dx%d fmt=%u ...", w, h, fmt);
     HRESULT hr = pDev->CreateOffscreenPlainSurface(
         w, h, fmt,
         D3DPOOL_SYSTEMMEM,   // CPU-accessible, no GPU bandwidth cost on lock
@@ -89,6 +90,7 @@ static bool EnsureSurface(IDirect3DDevice9* pDev, int idx,
 
     if (FAILED(hr))
     {
+        Log("[cap] CreateOffscreenPlainSurface failed: 0x%08X. Trying fallback X8R8G8B8...", hr);
         // Fallback: some drivers don't support the exact back-buffer format in
         // SYSTEMMEM — retry with the universal X8R8G8B8.
         if (fmt != D3DFMT_X8R8G8B8)
@@ -97,9 +99,16 @@ static bool EnsureSurface(IDirect3DDevice9* pDev, int idx,
                 w, h, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM,
                 &s.pSurf, nullptr);
             if (SUCCEEDED(hr))
+            {
+                Log("[cap] Fallback successful");
                 fmt = D3DFMT_X8R8G8B8;
+            }
         }
-        if (FAILED(hr)) return false;
+        if (FAILED(hr))
+        {
+            Log("[cap] Fallback FAILED: 0x%08X", hr);
+            return false;
+        }
     }
 
     s.width  = w;
@@ -122,6 +131,7 @@ void Capture_ReleaseSurfaces()
 
 void Capture_OnPreReset()
 {
+    Log("[cap] Capture_OnPreReset");
     // Must release all D3D resources before Reset is called.
     std::lock_guard<std::mutex> lk(g_CapMtx);
     for (auto& s : g_Staging)
@@ -153,12 +163,19 @@ void Capture_OnPresent(IDirect3DDevice9* pDev)
 {
     if (g_Shutdown.load()) return;
 
+    static bool logged = false;
+    if (!logged) { Log("[cap] Capture_OnPresent called (first time)"); logged = true; }
+
     std::lock_guard<std::mutex> lk(g_CapMtx);
 
     // ── A: get back buffer ───────────────────────────────────────────────────
     IDirect3DSurface9* pBB = nullptr;
     if (FAILED(pDev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &pBB)) || !pBB)
+    {
+        static int errorCount = 0;
+        if (errorCount++ < 10) Log("[cap] GetBackBuffer failed");
         return;
+    }
 
     D3DSURFACE_DESC desc = {};
     pBB->GetDesc(&desc);
@@ -189,7 +206,12 @@ void Capture_OnPresent(IDirect3DDevice9* pDev)
     HRESULT hr = pDev->GetRenderTargetData(pBB, ws.pSurf);
     pBB->Release();
 
-    if (FAILED(hr)) return;
+    if (FAILED(hr))
+    {
+        static int errorCount = 0;
+        if (errorCount++ < 10) Log("[cap] GetRenderTargetData failed: 0x%08X", hr);
+        return;
+    }
     ws.pending = true;
 
     // ── D: swap slots ─────────────────────────────────────────────────────
@@ -206,7 +228,12 @@ void Capture_OnPresent(IDirect3DDevice9* pDev)
     // D3DLOCK_NO_DIRTY_UPDATE – skip dirty-rect bookkeeping (SYSTEMMEM surfaces)
     hr = rs.pSurf->LockRect(&lr, nullptr,
                              D3DLOCK_READONLY | D3DLOCK_NO_DIRTY_UPDATE);
-    if (FAILED(hr)) return;
+    if (FAILED(hr))
+    {
+        static int errorCount = 0;
+        if (errorCount++ < 10) Log("[cap] LockRect failed: 0x%08X", hr);
+        return;
+    }
 
     FrameData fd;
     fd.pixels   = lr.pBits;

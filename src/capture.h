@@ -23,6 +23,9 @@
 #include <windows.h>
 #include <d3d9.h>
 
+// ── logging helper (defined in dllmain.cpp) ──────────────────────────────────
+void Log(const char* fmt, ...);
+
 // ── public API (Capture_Init / Capture_Shutdown defined in consumer_backend.cpp)
 void Capture_Init();
 void Capture_OnPresent(IDirect3DDevice9* pDev);
