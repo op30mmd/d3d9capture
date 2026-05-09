@@ -40,6 +40,8 @@ static constexpr int VT_D3D9_CREATEDEVICE    = 16; // IDirect3D9::CreateDevice
 static constexpr int VT_D3D9_CREATEDEVICEEX  = 20; // IDirect3D9Ex::CreateDeviceEx
 static constexpr int VT_DEVICE_RESET         = 16; // IDirect3DDevice9::Reset
 static constexpr int VT_DEVICE_PRESENT       = 17; // IDirect3DDevice9::Present
+static constexpr int VT_DEVICE_PRESENT_EX    = 121; // IDirect3DDevice9Ex::PresentEx
+static constexpr int VT_DEVICE_RESET_EX      = 132; // IDirect3DDevice9Ex::ResetEx
 
 // ── hook typedefs ─────────────────────────────────────────────────────────────
 typedef IDirect3D9* (WINAPI *PFN_Direct3DCreate9)(UINT);
@@ -54,6 +56,12 @@ typedef HRESULT (WINAPI *PFN_Present)(
 typedef HRESULT (WINAPI *PFN_Reset)(
     IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 
+typedef HRESULT (WINAPI *PFN_PresentEx)(
+    IDirect3DDevice9Ex*, const RECT*, const RECT*, HWND, const RGNDATA*, DWORD);
+
+typedef HRESULT (WINAPI *PFN_ResetEx)(
+    IDirect3DDevice9Ex*, D3DPRESENT_PARAMETERS*, D3DDISPLAYMODEEX*);
+
 typedef HRESULT (WINAPI *PFN_CreateDeviceEx)(
     IDirect3D9Ex*, UINT, D3DDEVTYPE, HWND, DWORD,
     D3DPRESENT_PARAMETERS*, D3DDISPLAYMODEEX*, IDirect3DDevice9**);
@@ -62,7 +70,9 @@ typedef HRESULT (WINAPI *PFN_CreateDeviceEx)(
 static PFN_CreateDevice    g_OrigCreateDevice   = nullptr;
 static PFN_CreateDeviceEx  g_OrigCreateDeviceEx = nullptr;
 static PFN_Present         g_OrigPresent        = nullptr;
+static PFN_PresentEx       g_OrigPresentEx      = nullptr;
 static PFN_Reset           g_OrigReset          = nullptr;
+static PFN_ResetEx         g_OrigResetEx        = nullptr;
 
 static std::mutex        g_HookMtx;
 static std::atomic<bool> g_DeviceHooked{ false };
@@ -99,7 +109,25 @@ static HRESULT WINAPI Hooked_Reset(
     return hr;
 }
 
-static void InstallDeviceHooks(IDirect3DDevice9* pDev)
+static HRESULT WINAPI Hooked_PresentEx(
+    IDirect3DDevice9Ex* pDev,
+    const RECT* pSrc, const RECT* pDst, HWND hWnd, const RGNDATA* pDirty, DWORD Flags)
+{
+    Capture_OnPresent(pDev);
+    return g_OrigPresentEx(pDev, pSrc, pDst, hWnd, pDirty, Flags);
+}
+
+static HRESULT WINAPI Hooked_ResetEx(
+    IDirect3DDevice9Ex* pDev, D3DPRESENT_PARAMETERS* pPP, D3DDISPLAYMODEEX* pMode)
+{
+    Capture_OnPreReset();
+    HRESULT hr = g_OrigResetEx(pDev, pPP, pMode);
+    if (SUCCEEDED(hr))
+        Capture_OnPostReset(pDev);
+    return hr;
+}
+
+static void InstallDeviceHooks(IDirect3DDevice9* pDev, bool bIsEx)
 {
     std::lock_guard<std::mutex> lk(g_HookMtx);
     if (g_DeviceHooked.load()) return;
@@ -110,6 +138,15 @@ static void InstallDeviceHooks(IDirect3DDevice9* pDev)
                       (void**)&g_OrigPresent);
     ok &= PatchVTable(&vtbl[VT_DEVICE_RESET],   (void*)Hooked_Reset,
                       (void**)&g_OrigReset);
+
+    if (bIsEx)
+    {
+        ok &= PatchVTable(&vtbl[VT_DEVICE_PRESENT_EX], (void*)Hooked_PresentEx,
+                          (void**)&g_OrigPresentEx);
+        ok &= PatchVTable(&vtbl[VT_DEVICE_RESET_EX],   (void*)Hooked_ResetEx,
+                          (void**)&g_OrigResetEx);
+    }
+
     if (ok)
         g_DeviceHooked.store(true);
 }
@@ -129,7 +166,7 @@ static HRESULT WINAPI Hooked_CreateDevice(
         pD3D, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPP, ppDevice);
 
     if (SUCCEEDED(hr) && ppDevice && *ppDevice)
-        InstallDeviceHooks(*ppDevice);
+        InstallDeviceHooks(*ppDevice, false);
 
     return hr;
 }
@@ -148,7 +185,7 @@ static HRESULT WINAPI Hooked_CreateDeviceEx(
         pD3D, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPP, pOutMode, ppDevice);
 
     if (SUCCEEDED(hr) && ppDevice && *ppDevice)
-        InstallDeviceHooks(*ppDevice);
+        InstallDeviceHooks(*ppDevice, true);
 
     return hr;
 }
