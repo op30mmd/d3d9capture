@@ -37,6 +37,7 @@
 
 // ── vtable slot indices ───────────────────────────────────────────────────────
 static constexpr int VT_D3D9_CREATEDEVICE    = 16; // IDirect3D9::CreateDevice
+static constexpr int VT_D3D9_CREATEDEVICEEX  = 20; // IDirect3D9Ex::CreateDeviceEx
 static constexpr int VT_DEVICE_RESET         = 16; // IDirect3DDevice9::Reset
 static constexpr int VT_DEVICE_PRESENT       = 17; // IDirect3DDevice9::Present
 
@@ -53,10 +54,15 @@ typedef HRESULT (WINAPI *PFN_Present)(
 typedef HRESULT (WINAPI *PFN_Reset)(
     IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 
+typedef HRESULT (WINAPI *PFN_CreateDeviceEx)(
+    IDirect3D9Ex*, UINT, D3DDEVTYPE, HWND, DWORD,
+    D3DPRESENT_PARAMETERS*, D3DDISPLAYMODEEX*, IDirect3DDevice9**);
+
 // ── saved originals (trampolines) ─────────────────────────────────────────────
-static PFN_CreateDevice  g_OrigCreateDevice = nullptr;
-static PFN_Present       g_OrigPresent      = nullptr;
-static PFN_Reset         g_OrigReset        = nullptr;
+static PFN_CreateDevice    g_OrigCreateDevice   = nullptr;
+static PFN_CreateDeviceEx  g_OrigCreateDeviceEx = nullptr;
+static PFN_Present         g_OrigPresent        = nullptr;
+static PFN_Reset           g_OrigReset          = nullptr;
 
 static std::mutex        g_HookMtx;
 static std::atomic<bool> g_DeviceHooked{ false };
@@ -64,6 +70,7 @@ static std::atomic<bool> g_DeviceHooked{ false };
 // ── vtable patcher ────────────────────────────────────────────────────────────
 static bool PatchVTable(void** ppSlot, void* pNew, void** ppOld)
 {
+    if (*ppSlot == pNew) return true;
     DWORD oldProt = 0;
     if (!VirtualProtect(ppSlot, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProt))
         return false;
@@ -127,16 +134,58 @@ static HRESULT WINAPI Hooked_CreateDevice(
     return hr;
 }
 
+static HRESULT WINAPI Hooked_CreateDeviceEx(
+    IDirect3D9Ex*           pD3D,
+    UINT                    Adapter,
+    D3DDEVTYPE              DeviceType,
+    HWND                    hFocusWindow,
+    DWORD                   BehaviorFlags,
+    D3DPRESENT_PARAMETERS*  pPP,
+    D3DDISPLAYMODEEX*       pOutMode,
+    IDirect3DDevice9**      ppDevice)
+{
+    HRESULT hr = g_OrigCreateDeviceEx(
+        pD3D, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPP, pOutMode, ppDevice);
+
+    if (SUCCEEDED(hr) && ppDevice && *ppDevice)
+        InstallDeviceHooks(*ppDevice);
+
+    return hr;
+}
+
 // ── IDirect3D9 vtable hook setup ──────────────────────────────────────────────
 // We call Direct3DCreate9 once to obtain an IDirect3D9 pointer, read its
 // vtable, patch CreateDevice, then immediately release the object.
 // No device is ever created by us; no GPU resources are touched.
 static void HookDirect3D9Factory()
 {
+    typedef HRESULT (WINAPI *PFN_Direct3DCreate9Ex)(UINT, IDirect3D9Ex**);
+
     // Load d3d9.dll if not already loaded (it always is in a D3D9 game).
     HMODULE hD3D9 = GetModuleHandleA("d3d9.dll");
     if (!hD3D9) hD3D9 = LoadLibraryA("d3d9.dll");
     if (!hD3D9) return;
+
+    auto pfnCreateEx = reinterpret_cast<PFN_Direct3DCreate9Ex>(
+        GetProcAddress(hD3D9, "Direct3DCreate9Ex"));
+
+    if (pfnCreateEx)
+    {
+        IDirect3D9Ex* pD3DEx = nullptr;
+        if (SUCCEEDED(pfnCreateEx(D3D_SDK_VERSION, &pD3DEx)) && pD3DEx)
+        {
+            void** vtbl = *reinterpret_cast<void***>(pD3DEx);
+            PatchVTable(&vtbl[VT_D3D9_CREATEDEVICE],   (void*)Hooked_CreateDevice,
+                        (void**)&g_OrigCreateDevice);
+            PatchVTable(&vtbl[VT_D3D9_CREATEDEVICEEX], (void*)Hooked_CreateDeviceEx,
+                        (void**)&g_OrigCreateDeviceEx);
+
+            // NOTE: We intentionally do NOT call pD3DEx->Release() here.
+            // In some games (GTA IV), releasing the factory on a background
+            // thread during early initialization can trigger a deadlock.
+            return;
+        }
+    }
 
     auto pfnCreate = reinterpret_cast<PFN_Direct3DCreate9>(
         GetProcAddress(hD3D9, "Direct3DCreate9"));
@@ -150,8 +199,7 @@ static void HookDirect3D9Factory()
     PatchVTable(&vtbl[VT_D3D9_CREATEDEVICE], (void*)Hooked_CreateDevice,
                 (void**)&g_OrigCreateDevice);
 
-    // Release immediately — we only needed the vtable address.
-    pD3D->Release();
+    // NOTE: pD3D->Release() removed to avoid destruction-related deadlocks.
 }
 
 // ── worker thread ─────────────────────────────────────────────────────────────
@@ -160,7 +208,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
     // Brief delay so d3d9.dll is mapped before we query it.
     // We don't need to wait for the game's device — our CreateDevice hook
     // will fire on the game's own thread at the right moment.
-    Sleep(200);
+    Sleep(2000);
 
     Capture_Init();
     HookDirect3D9Factory();
