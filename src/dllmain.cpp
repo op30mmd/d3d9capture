@@ -399,8 +399,67 @@ static void PatchModuleImports(HMODULE module)
     }
 }
 
+// GTA IV resolves Direct3DCreate9 through GetProcAddress, so there is no IAT
+// entry to intercept.  For the supported x86 GTAIV.exe build, its master RAGE
+// graphics context lives at VA 0x01295888 when loaded at image base 0x00400000;
+// the usable IDirect3DDevice9 interface is at context + 0x160.  Polling this
+// already-owned context avoids calling into D3D9 during startup.
+static constexpr uintptr_t GTAIV_CONTEXT_RVA = 0x01295888u - 0x00400000u;
+static constexpr size_t GTAIV_DEVICE_OFFSET = 0x160u;
+
+static bool ReadTargetPointer(const void* address, void** value)
+{
+    SIZE_T read = 0;
+    return ReadProcessMemory(GetCurrentProcess(), address, value, sizeof(*value), &read) &&
+           read == sizeof(*value);
+}
+
+static bool IsGTAIVExecutable()
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    const char* name = strrchr(path, '\\');
+    return _stricmp(name ? name + 1 : path, "GTAIV.exe") == 0;
+}
+
+static void WaitForGTAIVDevice()
+{
+#if defined(_WIN64)
+    Log("[gtaiv] RAGE context resolver is only valid for the x86 GTA IV executable");
+#else
+    const uintptr_t contextAddress = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr)) + GTAIV_CONTEXT_RVA;
+    Log("[gtaiv] Waiting for RAGE device context at %p (device offset +0x%X)",
+        reinterpret_cast<void*>(contextAddress), static_cast<unsigned>(GTAIV_DEVICE_OFFSET));
+
+    for (unsigned elapsed = 0; elapsed < 60000 && !g_DeviceHooked.load(); elapsed += 10)
+    {
+        void* context = nullptr;
+        void* device = nullptr;
+        void* vtable = nullptr;
+        void* present = nullptr;
+        if (ReadTargetPointer(reinterpret_cast<void*>(contextAddress), &context) && context &&
+            ReadTargetPointer(static_cast<unsigned char*>(context) + GTAIV_DEVICE_OFFSET, &device) && device &&
+            ReadTargetPointer(device, &vtable) && vtable &&
+            ReadTargetPointer(static_cast<void**>(vtable) + VT_DEVICE_PRESENT, &present) && present)
+        {
+            Log("[gtaiv] Found RAGE device=%p vtable=%p Present=%p after %u ms", device, vtable, present, elapsed);
+            InstallDeviceHooks(static_cast<IDirect3DDevice9*>(device), false);
+            return;
+        }
+        Sleep(10);
+    }
+    Log("[gtaiv] Timed out waiting for RAGE device context; no device was hooked");
+#endif
+}
+
 static void HookDirect3D9Factory()
 {
+    if (IsGTAIVExecutable())
+    {
+        WaitForGTAIVDevice();
+        return;
+    }
+
     // Restrict the early-startup hook to the executable's import table.  A
     // process can contain overlays, compatibility layers, and D3D helper DLLs
     // which also import Direct3DCreate9 while establishing their own loader
