@@ -473,6 +473,24 @@ static void WaitForGTAIVDevice()
             Log("[gtaiv] RAGE context changed: %p at %u ms", context, elapsed);
             lastContext = context;
         }
+        // A late attach may miss CreateDevice entirely. The verified RAGE
+        // context also retains a secondary device reference at +0x160; prefer
+        // it when it exposes a valid Present slot so an already-running game
+        // can be captured without recreating anything.
+        void* device = nullptr;
+        void* deviceVTable = nullptr;
+        void* present = nullptr;
+        if (context &&
+            ReadTargetPointer(static_cast<unsigned char*>(context) + 0x160, &device) && device &&
+            ReadTargetPointer(device, &deviceVTable) && deviceVTable &&
+            ReadTargetPointer(static_cast<void**>(deviceVTable) + VT_DEVICE_PRESENT, &present) && present)
+        {
+            Log("[gtaiv] Found existing device candidate=%p vtable=%p Present=%p after %u ms",
+                device, deviceVTable, present, elapsed);
+            InstallDeviceHooks(static_cast<IDirect3DDevice9*>(device), false);
+            if (g_DeviceHooked.load()) return;
+        }
+
         if (context &&
             ReadTargetPointer(context, &factory) && factory &&
             ReadTargetPointer(factory, &vtable) && vtable &&
