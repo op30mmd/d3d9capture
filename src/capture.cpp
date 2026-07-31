@@ -57,6 +57,7 @@ static StagingSurface          g_Staging[NUM_STAGING];
 static int                     g_WriteIdx = 0;   // surface we're filling now
 static int                     g_ReadIdx  = 1;   // surface ready to consume
 static std::atomic<UINT64>     g_FrameIdx{ 0 };
+static std::atomic<UINT64>     g_PresentCalls{ 0 };
 static std::atomic<bool>       g_Shutdown{ false };
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -163,8 +164,9 @@ void Capture_OnPresent(IDirect3DDevice9* pDev)
 {
     if (g_Shutdown.load()) return;
 
+    const UINT64 presentNumber = g_PresentCalls.fetch_add(1) + 1;
     static bool logged = false;
-    if (!logged) { Log("[cap] Capture_OnPresent called (first time)"); logged = true; }
+    if (!logged) { Log("[cap] Capture_OnPresent called (first time), device=%p", pDev); logged = true; }
 
     std::lock_guard<std::mutex> lk(g_CapMtx);
 
@@ -178,7 +180,20 @@ void Capture_OnPresent(IDirect3DDevice9* pDev)
     }
 
     D3DSURFACE_DESC desc = {};
-    pBB->GetDesc(&desc);
+    HRESULT descHr = pBB->GetDesc(&desc);
+    if (FAILED(descHr))
+    {
+        Log("[cap] Back-buffer GetDesc failed: 0x%08X", descHr);
+        pBB->Release();
+        return;
+    }
+    static bool loggedDesc = false;
+    if (!loggedDesc)
+    {
+        Log("[cap] Back-buffer: %ux%u format=%u multisample=%u", desc.Width, desc.Height,
+            static_cast<unsigned>(desc.Format), static_cast<unsigned>(desc.MultiSampleType));
+        loggedDesc = true;
+    }
 
     if (desc.Width  == 0 || desc.Width  > MAX_WIDTH  ||
         desc.Height == 0 || desc.Height > MAX_HEIGHT)
@@ -244,6 +259,12 @@ void Capture_OnPresent(IDirect3DDevice9* pDev)
     fd.frameIdx = g_FrameIdx.fetch_add(1);
 
     Capture_FrameReady(fd);   // consumer must return before we unlock!
+
+    if ((presentNumber % 300) == 0)
+        Log("[cap] heartbeat: presents=%llu captured=%llu %ux%u stride=%u fmt=%u",
+            static_cast<unsigned long long>(presentNumber),
+            static_cast<unsigned long long>(fd.frameIdx + 1), fd.width, fd.height,
+            fd.stride, static_cast<unsigned>(fd.format));
 
     rs.pSurf->UnlockRect();
 }

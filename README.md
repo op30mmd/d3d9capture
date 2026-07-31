@@ -52,7 +52,7 @@ directly from the GPU's back-buffer immediately after the game draws them.
 
 | File | Purpose |
 |---|---|
-| `dllmain.cpp` | DLL entry point; creates temp device to harvest vtable; patches Present + Reset |
+| `dllmain.cpp` | DLL entry point; hooks D3D9 factory imports and patches Present + Reset |
 | `capture.h/cpp` | Double-buffered GPU readback via `GetRenderTargetData` |
 | `consumer_backend.cpp` | Writes frames to named shared memory; optional BMP debug dumps |
 | `inject_tool.cpp` | `CreateRemoteThread` injector; accepts PID or process name |
@@ -86,31 +86,57 @@ Outputs land in `d3d9capture\bin\`.
 :: Terminal 1 — start the frame reader first
 shm_reader.exe
 
-:: Terminal 2 — launch the game, then inject
-inject_tool.exe  game.exe  C:\path\to\d3d9capture.dll
+:: Terminal 2 — recommended: launch suspended, inject, then resume automatically
+inject_tool.exe --launch C:\Games\GTAIV\GTAIV.exe C:\path\to\d3d9capture.dll
+:: Optional game arguments follow `--`:
+inject_tool.exe --launch C:\Games\GTAIV\GTAIV.exe C:\path\to\d3d9capture.dll -- -windowed
+
+:: Existing process support (only works if D3D9 has not initialized yet):
+inject_tool.exe game.exe C:\path\to\d3d9capture.dll
 :: or by PID:
-inject_tool.exe  1234     C:\path\to\d3d9capture.dll
+inject_tool.exe 1234 C:\path\to\d3d9capture.dll
 ```
 
 The first `DUMP_FRAMES` (default: 10) frames are saved as BMP files to
 `C:\d3d9capture\` for verification.
 
+> **Injection timing:** inject before the game creates its D3D9 factory (for
+> example, immediately after launch). The hook intentionally does not create a
+> probe D3D object to attach to an already-created device, because doing that
+> during GTA IV initialization can deadlock the game.
+
+### Runtime diagnostics
+
+The DLL writes a timestamped process/thread trace to both the debugger and
+`C:\\d3d9capture\\debug.log`. It records import discovery and patch addresses,
+factory/device creation arguments and HRESULTs, first back-buffer properties,
+capture failures, reset events, and a capture heartbeat every 300 presents.
+Attach DebugView or inspect this file when a title fails to hook. A diagnostic
+saying no normal factory imports were found generally means the title uses
+`GetProcAddress`, delay loading, or D3D9 had already been initialized before
+injection.
+
 ---
 
 ## How the Capture Works
 
-### 1. VTable Patching
-D3D9 devices are COM objects; their virtual-method dispatch table is a plain
-array of function pointers in read-only memory. We:
+### 1. Factory Import and VTable Patching
+The DLL replaces the game executable's imports of `Direct3DCreate9` and
+`Direct3DCreate9Ex` with lightweight forwarding hooks. Limiting the early
+startup patch to the executable avoids re-entering overlay or compatibility
+DLL initialization. The forwarding hook calls the game's original import, then
+patches only the returned factory object's `CreateDevice`/`CreateDeviceEx`
+slots. When the game
+creates its device, those hooks patch `Present` and `Reset` on that device.
 
-1. Create a tiny invisible device (1×1 pixel, software VP) just to locate
-   the vtable in memory.
-2. Call `VirtualProtect` to make the two target slots writable.
-3. Swap in our hook pointers, saving the originals as trampolines.
-4. Restore the page protection.
-
-Because COM vtables are **per-class, not per-instance**, patching the dummy
-device's vtable simultaneously patches the game's device.
+This never creates or releases a D3D factory/device from the injection worker.
+That avoids the D3D9 initialization-lock deadlock seen in GTA IV, and is more
+compatible with D3D9 proxy/wrapper DLLs that do not share vtables between
+objects. For the supported x86 `GTAIV.exe`, which resolves `Direct3DCreate9`
+via `GetProcAddress` rather than an import, the DLL instead waits for the RAGE
+master graphics context and hooks its wrapper `IDirect3D9::CreateDevice` slot
+at context offset `+0x000`. Each modified slot is made writable with `VirtualProtect`, exchanged
+atomically, and its original function is retained as the forwarding target.
 
 ### 2. Present Hook (slot 17)
 `Present` is called exactly once per rendered frame. Inside the hook:
