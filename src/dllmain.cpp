@@ -186,39 +186,58 @@ static HRESULT WINAPI Hooked_ResetEx(
     return hr;
 }
 
+static constexpr size_t VT_D3D9_COUNT = 17;       // final base slot: CreateDevice
+static constexpr size_t VT_D3D9EX_COUNT = 21;     // final Ex slot: CreateDeviceEx
+static constexpr size_t VT_DEVICE_COUNT = 119;    // final base slot: CreateQuery
+static constexpr size_t VT_DEVICEEX_COUNT = 133;  // final Ex slot: ResetEx
+
+// Many overlays (including the GTA IV D3D wrapper) share a D3D runtime vtable
+// between objects. Never edit that shared read-only table: give only the object
+// we received a private, writable vtable copy. This avoids clobbering ReShade,
+// the system runtime, and other device users.
+static void** CloneObjectVTable(void* object, size_t count)
+{
+    if (!object || !count) return nullptr;
+    void*** objectVTable = reinterpret_cast<void***>(object);
+    void** original = *objectVTable;
+    if (!original) return nullptr;
+
+    void** clone = static_cast<void**>(VirtualAlloc(nullptr, count * sizeof(void*),
+                                                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!clone) return nullptr;
+    memcpy(clone, original, count * sizeof(void*));
+    InterlockedExchangePointer(reinterpret_cast<void* volatile*>(objectVTable), clone);
+    return clone;
+}
+
 static void InstallDeviceHooks(IDirect3DDevice9* pDev, bool bIsEx)
 {
     std::lock_guard<std::mutex> lk(g_HookMtx);
-    if (g_DeviceHooked.load()) return;
+    if (g_DeviceHooked.load() || !pDev) return;
 
-    Log("[hook] Installing device hooks device=%p vtable=%p isEx=%d ...", pDev,
-        pDev ? *reinterpret_cast<void***>(pDev) : nullptr, bIsEx);
-    if (!pDev) return;
+    void** original = *reinterpret_cast<void***>(pDev);
+    Log("[hook] Installing private device hooks device=%p vtable=%p isEx=%d ...", pDev, original, bIsEx);
+    void** vtbl = CloneObjectVTable(pDev, bIsEx ? VT_DEVICEEX_COUNT : VT_DEVICE_COUNT);
+    if (!vtbl)
+    {
+        Log("[hook] FAILED to clone device vtable: %lu", GetLastError());
+        return;
+    }
 
-    void** vtbl = *reinterpret_cast<void***>(pDev);
-    bool ok = true;
-    ok &= PatchVTable(&vtbl[VT_DEVICE_PRESENT], (void*)Hooked_Present,
-                      (void**)&g_OrigPresent);
-    ok &= PatchVTable(&vtbl[VT_DEVICE_RESET],   (void*)Hooked_Reset,
-                      (void**)&g_OrigReset);
-
+    g_OrigPresent = reinterpret_cast<PFN_Present>(vtbl[VT_DEVICE_PRESENT]);
+    g_OrigReset = reinterpret_cast<PFN_Reset>(vtbl[VT_DEVICE_RESET]);
+    vtbl[VT_DEVICE_PRESENT] = reinterpret_cast<void*>(Hooked_Present);
+    vtbl[VT_DEVICE_RESET] = reinterpret_cast<void*>(Hooked_Reset);
     if (bIsEx)
     {
-        ok &= PatchVTable(&vtbl[VT_DEVICE_PRESENT_EX], (void*)Hooked_PresentEx,
-                          (void**)&g_OrigPresentEx);
-        ok &= PatchVTable(&vtbl[VT_DEVICE_RESET_EX],   (void*)Hooked_ResetEx,
-                          (void**)&g_OrigResetEx);
+        g_OrigPresentEx = reinterpret_cast<PFN_PresentEx>(vtbl[VT_DEVICE_PRESENT_EX]);
+        g_OrigResetEx = reinterpret_cast<PFN_ResetEx>(vtbl[VT_DEVICE_RESET_EX]);
+        vtbl[VT_DEVICE_PRESENT_EX] = reinterpret_cast<void*>(Hooked_PresentEx);
+        vtbl[VT_DEVICE_RESET_EX] = reinterpret_cast<void*>(Hooked_ResetEx);
     }
 
-    if (ok)
-    {
-        Log("[dll] Device hooks installed successfully");
-        g_DeviceHooked.store(true);
-    }
-    else
-    {
-        Log("[dll] FAILED to install device hooks");
-    }
+    Log("[hook] Device hooks installed successfully (private vtable=%p)", vtbl);
+    g_DeviceHooked.store(true);
 }
 
 // ── IDirect3D9::CreateDevice hook ─────────────────────────────────────────────
@@ -288,12 +307,22 @@ static void InstallFactoryHooks(IDirect3D9* pD3D, bool isEx)
 {
     if (!pD3D) return;
 
-    void** vtbl = *reinterpret_cast<void***>(pD3D);
-    PatchVTable(&vtbl[VT_D3D9_CREATEDEVICE], (void*)Hooked_CreateDevice,
-                (void**)&g_OrigCreateDevice);
+    void** original = *reinterpret_cast<void***>(pD3D);
+    void** vtbl = CloneObjectVTable(pD3D, isEx ? VT_D3D9EX_COUNT : VT_D3D9_COUNT);
+    if (!vtbl)
+    {
+        Log("[hook] FAILED to clone factory vtable=%p: %lu", original, GetLastError());
+        return;
+    }
+
+    g_OrigCreateDevice = reinterpret_cast<PFN_CreateDevice>(vtbl[VT_D3D9_CREATEDEVICE]);
+    vtbl[VT_D3D9_CREATEDEVICE] = reinterpret_cast<void*>(Hooked_CreateDevice);
     if (isEx)
-        PatchVTable(&vtbl[VT_D3D9_CREATEDEVICEEX], (void*)Hooked_CreateDeviceEx,
-                    (void**)&g_OrigCreateDeviceEx);
+    {
+        g_OrigCreateDeviceEx = reinterpret_cast<PFN_CreateDeviceEx>(vtbl[VT_D3D9_CREATEDEVICEEX]);
+        vtbl[VT_D3D9_CREATEDEVICEEX] = reinterpret_cast<void*>(Hooked_CreateDeviceEx);
+    }
+    Log("[hook] Factory hooks installed with private vtable=%p (original=%p)", vtbl, original);
 }
 
 static IDirect3D9* WINAPI Hooked_Direct3DCreate9(UINT sdkVersion)
