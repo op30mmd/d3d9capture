@@ -534,11 +534,12 @@ static void SignalInjectorReady()
 
 static DWORD WINAPI WorkerThread(LPVOID)
 {
+    // DllMain returns while the loader lock is held. Do not run CRT/file/shared
+    // memory code until it has been released; the primary game thread remains
+    // suspended in --launch mode, so this short delay cannot lose D3D startup.
+    Sleep(100);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    Log("[dll] WorkerThread started");
-    // Install immediately. Waiting here loses games which construct D3D9
-    // during startup, and calling Direct3DCreate9 ourselves to catch up is the
-    // GTA IV deadlock that this implementation avoids.
+    Log("[dll] WorkerThread started (loader lock delay complete)");
     Capture_Init();
 
     // The suspended-launch injector waits for this acknowledgement before it
@@ -557,14 +558,16 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
     {
     case DLL_PROCESS_ATTACH:
         g_ThisModule = hInst;
-        Log("[dll] DllMain(DLL_PROCESS_ATTACH), module=%p", hInst);
         DisableThreadLibraryCalls(hInst);
+        // DllMain must remain loader-lock safe: no logging, file I/O, D3D, or
+        // capture teardown belongs here. The worker performs initialization
+        // after a loader-lock delay.
         CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
         break;
 
     case DLL_PROCESS_DETACH:
-        Log("[dll] DllMain(DLL_PROCESS_DETACH)");
-        Capture_Shutdown();
+        // Process teardown may hold the loader lock. Avoid releasing D3D/IPC
+        // resources here; Windows reclaims process resources on termination.
         break;
     }
     return TRUE;
