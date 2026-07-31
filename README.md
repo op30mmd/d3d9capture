@@ -134,8 +134,8 @@ That avoids the D3D9 initialization-lock deadlock seen in GTA IV, and is more
 compatible with D3D9 proxy/wrapper DLLs that do not share vtables between
 objects. For the supported x86 `GTAIV.exe`, which resolves `Direct3DCreate9`
 via `GetProcAddress` rather than an import, the DLL instead waits for the RAGE
-master graphics context and hooks its device at the known `+0x160` interface
-slot. Each modified slot is made writable with `VirtualProtect`, exchanged
+master graphics context and hooks its wrapper `IDirect3D9::CreateDevice` slot
+at context offset `+0x000`. Each modified slot is made writable with `VirtualProtect`, exchanged
 atomically, and its original function is retained as the forwarding target.
 
 ### 2. Present Hook (slot 17)

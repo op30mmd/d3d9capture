@@ -400,14 +400,14 @@ static void PatchModuleImports(HMODULE module)
 }
 
 // GTA IV resolves Direct3DCreate9 through GetProcAddress, so there is no IAT
-// entry to intercept.  For the supported x86 GTAIV.exe build, its master RAGE
-// graphics context lives at VA 0x01295888 when loaded at image base 0x00400000;
-// the usable IDirect3DDevice9 interface is at context + 0x160.  Polling this
-// already-owned context avoids calling into D3D9 during startup.
-// 0x01295888 is the preferred-image VA reported by analysis.  Its RVA is
-// 0x00E95888 (not 0x00D95888): retain the subtraction so ASLR is handled.
+// entry to intercept. For the supported x86 GTAIV.exe build, its master RAGE
+// graphics context lives at VA 0x01295888 when loaded at image base 0x00400000.
+// Context +0 is the wrapper IDirect3D9 interface; the game's d3d9 wrapper
+// redirects its CreateDevice vtable slot to its own implementation. Patching
+// that existing wrapper catches the real device without calling D3D9 ourselves.
+// 0x01295888 is the preferred-image VA reported by analysis. Its RVA is
+// 0x00E95888: retain the subtraction so ASLR is handled.
 static constexpr uintptr_t GTAIV_CONTEXT_RVA = 0x01295888u - 0x00400000u;
-static constexpr size_t GTAIV_DEVICE_OFFSET = 0x160u;
 
 static bool ReadTargetPointer(const void* address, void** value)
 {
@@ -430,33 +430,34 @@ static void WaitForGTAIVDevice()
     Log("[gtaiv] RAGE context resolver is only valid for the x86 GTA IV executable");
 #else
     const uintptr_t contextAddress = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr)) + GTAIV_CONTEXT_RVA;
-    Log("[gtaiv] Waiting for RAGE device context at %p (device offset +0x%X)",
-        reinterpret_cast<void*>(contextAddress), static_cast<unsigned>(GTAIV_DEVICE_OFFSET));
+    Log("[gtaiv] Waiting for RAGE IDirect3D9 context at %p", reinterpret_cast<void*>(contextAddress));
 
     void* lastContext = nullptr;
     for (unsigned elapsed = 0; elapsed < 60000 && !g_DeviceHooked.load(); elapsed += 10)
     {
         void* context = nullptr;
-        void* device = nullptr;
+        void* factory = nullptr;
         void* vtable = nullptr;
-        void* present = nullptr;
+        void* createDevice = nullptr;
         if (ReadTargetPointer(reinterpret_cast<void*>(contextAddress), &context) && context != lastContext)
         {
             Log("[gtaiv] RAGE context changed: %p at %u ms", context, elapsed);
             lastContext = context;
         }
         if (context &&
-            ReadTargetPointer(static_cast<unsigned char*>(context) + GTAIV_DEVICE_OFFSET, &device) && device &&
-            ReadTargetPointer(device, &vtable) && vtable &&
-            ReadTargetPointer(static_cast<void**>(vtable) + VT_DEVICE_PRESENT, &present) && present)
+            ReadTargetPointer(context, &factory) && factory &&
+            ReadTargetPointer(factory, &vtable) && vtable &&
+            ReadTargetPointer(static_cast<void**>(vtable) + VT_D3D9_CREATEDEVICE, &createDevice) && createDevice)
         {
-            Log("[gtaiv] Found RAGE device=%p vtable=%p Present=%p after %u ms", device, vtable, present, elapsed);
-            InstallDeviceHooks(static_cast<IDirect3DDevice9*>(device), false);
+            Log("[gtaiv] Found RAGE factory=%p vtable=%p CreateDevice=%p after %u ms",
+                factory, vtable, createDevice, elapsed);
+            InstallFactoryHooks(static_cast<IDirect3D9*>(factory), false);
+            Log("[gtaiv] Hooked wrapper CreateDevice; waiting for the game to create its device");
             return;
         }
         Sleep(10);
     }
-    Log("[gtaiv] Timed out waiting for RAGE device context; no device was hooked");
+    Log("[gtaiv] Timed out waiting for RAGE factory context; no device was hooked");
 #endif
 }
 
