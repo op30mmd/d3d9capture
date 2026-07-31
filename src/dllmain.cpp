@@ -1,13 +1,13 @@
 /**
  * d3d9capture - DLL Injector for Direct3D 9 Frame Capture
  *
- * Hook chain (no dummy device created):
+ * Hook chain (no D3D object is constructed by this DLL):
  *
- *   Direct3DCreate9()                  ← called by us once, briefly, to get
- *        │                               the IDirect3D9 vtable address only.
- *        ▼                               The object is released immediately.
- *   IDirect3D9::CreateDevice (slot 16) ← patched on the shared vtable so we
- *        │                               intercept the GAME'S CreateDevice call.
+ *   application's Direct3DCreate9/Ex import slot ← patched in the PE IAT
+ *        │                                          and calls the real export
+ *        ▼
+ *   IDirect3D9::CreateDevice (slot 16)          ← patched on that factory so
+ *        │                                          we intercept the game's call.
  *        ▼
  *   IDirect3DDevice9::Present (slot 17) ← patched on the device vtable.
  *   IDirect3DDevice9::Reset   (slot 16) ← patched on the device vtable.
@@ -18,9 +18,9 @@
  * contended with the game's own CreateDevice call on the render thread.
  * D3D9's internal critical section deadlocked, freezing the process.
  *
- * Here we only call Direct3DCreate9 (cheap — no GPU resources allocated) to
- * read the vtable, then release it immediately.  CreateDevice is never called
- * by us; we wait for the game to call it and intercept that call instead.
+ * Here we do not call into D3D9 at all from the injection worker.  We patch the
+ * game's Direct3DCreate9/Ex import slot, then wait for the game to create its
+ * own factory and device on its render thread.
  *
  * Build (MSVC, match game bitness — most D3D9 titles are 32-bit):
  *   cl /nologo /W3 /O2 /MD /LD /Fe:d3d9capture.dll dllmain.cpp capture.cpp
@@ -32,11 +32,13 @@
 #include <d3d9.h>
 #include <atomic>
 #include <mutex>
+#include <tlhelp32.h>
 
 #include "capture.h"
 
 #include <cstdio>
 #include <cstdarg>
+#include <cstring>
 
 // ── logging ──────────────────────────────────────────────────────────────────
 void Log(const char* fmt, ...)
@@ -67,6 +69,7 @@ static constexpr int VT_DEVICE_RESET_EX      = 132; // IDirect3DDevice9Ex::Reset
 
 // ── hook typedefs ─────────────────────────────────────────────────────────────
 typedef IDirect3D9* (WINAPI *PFN_Direct3DCreate9)(UINT);
+typedef HRESULT (WINAPI *PFN_Direct3DCreate9Ex)(UINT, IDirect3D9Ex**);
 
 typedef HRESULT (WINAPI *PFN_CreateDevice)(
     IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD,
@@ -89,6 +92,8 @@ typedef HRESULT (WINAPI *PFN_CreateDeviceEx)(
     D3DPRESENT_PARAMETERS*, D3DDISPLAYMODEEX*, IDirect3DDevice9**);
 
 // ── saved originals (trampolines) ─────────────────────────────────────────────
+static PFN_Direct3DCreate9   g_OrigDirect3DCreate9   = nullptr;
+static PFN_Direct3DCreate9Ex g_OrigDirect3DCreate9Ex = nullptr;
 static PFN_CreateDevice    g_OrigCreateDevice   = nullptr;
 static PFN_CreateDeviceEx  g_OrigCreateDeviceEx = nullptr;
 static PFN_Present         g_OrigPresent        = nullptr;
@@ -102,13 +107,22 @@ static std::atomic<bool> g_DeviceHooked{ false };
 // ── vtable patcher ────────────────────────────────────────────────────────────
 static bool PatchVTable(void** ppSlot, void* pNew, void** ppOld)
 {
+    if (!ppSlot || !pNew || !ppOld) return false;
     if (*ppSlot == pNew) return true;
+
     DWORD oldProt = 0;
     if (!VirtualProtect(ppSlot, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProt))
         return false;
-    *ppOld  = *ppSlot;
-    *ppSlot = pNew;
-    VirtualProtect(ppSlot, sizeof(void*), oldProt, &oldProt);
+
+    // An aligned pointer exchange is atomic on Windows.  This prevents another
+    // thread from observing a partially-written import/vtable entry.
+    void* old = InterlockedExchangePointer(ppSlot, pNew);
+    *ppOld = old;
+
+    DWORD ignored = 0;
+    if (!VirtualProtect(ppSlot, sizeof(void*), oldProt, &ignored))
+        Log("[dll] VirtualProtect restore failed: %lu", GetLastError());
+    FlushInstructionCache(GetCurrentProcess(), ppSlot, sizeof(void*));
     return true;
 }
 
@@ -229,68 +243,124 @@ static HRESULT WINAPI Hooked_CreateDeviceEx(
     return hr;
 }
 
-// ── IDirect3D9 vtable hook setup ──────────────────────────────────────────────
-// We call Direct3DCreate9 once to obtain an IDirect3D9 pointer, read its
-// vtable, patch CreateDevice, then immediately release the object.
-// No device is ever created by us; no GPU resources are touched.
-static void HookDirect3D9Factory()
+// ── factory hooks ─────────────────────────────────────────────────────────────
+// Hook the application's import slots rather than constructing a D3D object on
+// our worker thread.  Constructing/releasing a factory while GTA IV is bringing
+// up its renderer can contend on D3D9's loader/driver locks.  More importantly,
+// import hooks also work with proxy D3D9 implementations whose vtables are not
+// shared with a factory created by this DLL.
+static void InstallFactoryHooks(IDirect3D9* pD3D, bool isEx)
 {
-    typedef HRESULT (WINAPI *PFN_Direct3DCreate9Ex)(UINT, IDirect3D9Ex**);
-
-    Log("[dll] HookDirect3D9Factory() ...");
-
-    // Load d3d9.dll if not already loaded (it always is in a D3D9 game).
-    HMODULE hD3D9 = GetModuleHandleA("d3d9.dll");
-    if (!hD3D9) hD3D9 = LoadLibraryA("d3d9.dll");
-    if (!hD3D9) return;
-
-    auto pfnCreateEx = reinterpret_cast<PFN_Direct3DCreate9Ex>(
-        GetProcAddress(hD3D9, "Direct3DCreate9Ex"));
-
-    if (pfnCreateEx)
-    {
-        IDirect3D9Ex* pD3DEx = nullptr;
-        if (SUCCEEDED(pfnCreateEx(D3D_SDK_VERSION, &pD3DEx)) && pD3DEx)
-        {
-            Log("[dll] Hooking IDirect3D9Ex vtable ...");
-            void** vtbl = *reinterpret_cast<void***>(pD3DEx);
-            PatchVTable(&vtbl[VT_D3D9_CREATEDEVICE],   (void*)Hooked_CreateDevice,
-                        (void**)&g_OrigCreateDevice);
-            PatchVTable(&vtbl[VT_D3D9_CREATEDEVICEEX], (void*)Hooked_CreateDeviceEx,
-                        (void**)&g_OrigCreateDeviceEx);
-
-            // NOTE: We intentionally do NOT call pD3DEx->Release() here.
-            // In some games (GTA IV), releasing the factory on a background
-            // thread during early initialization can trigger a deadlock.
-            return;
-        }
-    }
-
-    auto pfnCreate = reinterpret_cast<PFN_Direct3DCreate9>(
-        GetProcAddress(hD3D9, "Direct3DCreate9"));
-    if (!pfnCreate) return;
-
-    IDirect3D9* pD3D = pfnCreate(D3D_SDK_VERSION);
     if (!pD3D) return;
 
-    Log("[dll] Hooking IDirect3D9 vtable ...");
-    // Patch CreateDevice on the shared IDirect3D9 vtable.
     void** vtbl = *reinterpret_cast<void***>(pD3D);
     PatchVTable(&vtbl[VT_D3D9_CREATEDEVICE], (void*)Hooked_CreateDevice,
                 (void**)&g_OrigCreateDevice);
+    if (isEx)
+        PatchVTable(&vtbl[VT_D3D9_CREATEDEVICEEX], (void*)Hooked_CreateDeviceEx,
+                    (void**)&g_OrigCreateDeviceEx);
+}
 
-    // NOTE: pD3D->Release() removed to avoid destruction-related deadlocks.
+static IDirect3D9* WINAPI Hooked_Direct3DCreate9(UINT sdkVersion)
+{
+    PFN_Direct3DCreate9 original = g_OrigDirect3DCreate9;
+    if (!original) return nullptr;
+
+    IDirect3D9* d3d = original(sdkVersion);
+    InstallFactoryHooks(d3d, false);
+    return d3d;
+}
+
+static HRESULT WINAPI Hooked_Direct3DCreate9Ex(UINT sdkVersion, IDirect3D9Ex** ppD3D)
+{
+    PFN_Direct3DCreate9Ex original = g_OrigDirect3DCreate9Ex;
+    if (!original) return E_FAIL;
+
+    HRESULT hr = original(sdkVersion, ppD3D);
+    if (SUCCEEDED(hr) && ppD3D)
+        InstallFactoryHooks(*ppD3D, true);
+    return hr;
+}
+
+static bool IsD3D9Import(const char* moduleName)
+{
+    return moduleName && (_stricmp(moduleName, "d3d9.dll") == 0 ||
+                          _stricmp(moduleName, "d3d9") == 0);
+}
+
+// Patch a module's normal PE import table.  We deliberately do not modify D3D9
+// code or create a dummy device: this is safe to run after DLL_PROCESS_ATTACH
+// and avoids GTA IV's initialization deadlock.
+static void PatchModuleImports(HMODULE module)
+{
+    if (!module) return;
+    auto base = reinterpret_cast<unsigned char*>(module);
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+    const IMAGE_DATA_DIRECTORY& imports =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!imports.VirtualAddress || !imports.Size) return;
+
+    auto desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + imports.VirtualAddress);
+    for (; desc->Name; ++desc)
+    {
+        if (!IsD3D9Import(reinterpret_cast<const char*>(base + desc->Name))) continue;
+
+        auto firstThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
+        auto nameThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base +
+            (desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk));
+        for (; nameThunk->u1.AddressOfData; ++nameThunk, ++firstThunk)
+        {
+            if (IMAGE_SNAP_BY_ORDINAL(nameThunk->u1.Ordinal)) continue;
+            auto import = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + nameThunk->u1.AddressOfData);
+            void* replacement = nullptr;
+            void** original = nullptr;
+            if (strcmp(reinterpret_cast<const char*>(import->Name), "Direct3DCreate9") == 0)
+            {
+                replacement = reinterpret_cast<void*>(Hooked_Direct3DCreate9);
+                original = reinterpret_cast<void**>(&g_OrigDirect3DCreate9);
+            }
+            else if (strcmp(reinterpret_cast<const char*>(import->Name), "Direct3DCreate9Ex") == 0)
+            {
+                replacement = reinterpret_cast<void*>(Hooked_Direct3DCreate9Ex);
+                original = reinterpret_cast<void**>(&g_OrigDirect3DCreate9Ex);
+            }
+            if (replacement)
+                PatchVTable(reinterpret_cast<void**>(&firstThunk->u1.Function), replacement, original);
+        }
+    }
+}
+
+static void HookDirect3D9Factory()
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE)
+    {
+        Log("[dll] Could not enumerate modules: %lu", GetLastError());
+        return;
+    }
+
+    MODULEENTRY32 entry = {};
+    entry.dwSize = sizeof(entry);
+    if (Module32First(snapshot, &entry))
+    {
+        do { PatchModuleImports(entry.hModule); }
+        while (Module32Next(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    Log("[dll] Installed D3D9 factory import hooks");
 }
 
 // ── worker thread ─────────────────────────────────────────────────────────────
 static DWORD WINAPI WorkerThread(LPVOID)
 {
     Log("[dll] WorkerThread started");
-    // Brief delay so d3d9.dll is mapped before we query it.
-    // We don't need to wait for the game's device — our CreateDevice hook
-    // will fire on the game's own thread at the right moment.
-    Sleep(2000);
-
+    // Install immediately.  Waiting here loses games which construct D3D9
+    // during startup, and calling Direct3DCreate9 ourselves to catch up is the
+    // GTA IV deadlock that this implementation avoids.
     Capture_Init();
     HookDirect3D9Factory();
 
