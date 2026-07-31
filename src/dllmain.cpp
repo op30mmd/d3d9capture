@@ -404,6 +404,8 @@ static void PatchModuleImports(HMODULE module)
 // graphics context lives at VA 0x01295888 when loaded at image base 0x00400000;
 // the usable IDirect3DDevice9 interface is at context + 0x160.  Polling this
 // already-owned context avoids calling into D3D9 during startup.
+// 0x01295888 is the preferred-image VA reported by analysis.  Its RVA is
+// 0x00E95888 (not 0x00D95888): retain the subtraction so ASLR is handled.
 static constexpr uintptr_t GTAIV_CONTEXT_RVA = 0x01295888u - 0x00400000u;
 static constexpr size_t GTAIV_DEVICE_OFFSET = 0x160u;
 
@@ -431,13 +433,19 @@ static void WaitForGTAIVDevice()
     Log("[gtaiv] Waiting for RAGE device context at %p (device offset +0x%X)",
         reinterpret_cast<void*>(contextAddress), static_cast<unsigned>(GTAIV_DEVICE_OFFSET));
 
+    void* lastContext = nullptr;
     for (unsigned elapsed = 0; elapsed < 60000 && !g_DeviceHooked.load(); elapsed += 10)
     {
         void* context = nullptr;
         void* device = nullptr;
         void* vtable = nullptr;
         void* present = nullptr;
-        if (ReadTargetPointer(reinterpret_cast<void*>(contextAddress), &context) && context &&
+        if (ReadTargetPointer(reinterpret_cast<void*>(contextAddress), &context) && context != lastContext)
+        {
+            Log("[gtaiv] RAGE context changed: %p at %u ms", context, elapsed);
+            lastContext = context;
+        }
+        if (context &&
             ReadTargetPointer(static_cast<unsigned char*>(context) + GTAIV_DEVICE_OFFSET, &device) && device &&
             ReadTargetPointer(device, &vtable) && vtable &&
             ReadTargetPointer(static_cast<void**>(vtable) + VT_DEVICE_PRESENT, &present) && present)
