@@ -121,10 +121,12 @@ injection.
 ## How the Capture Works
 
 ### 1. Factory Import and VTable Patching
-The DLL enumerates already loaded modules and replaces imports of
-`Direct3DCreate9` and `Direct3DCreate9Ex` with lightweight forwarding hooks.
-The forwarding hook calls the game's original import, then patches only the
-returned factory object's `CreateDevice`/`CreateDeviceEx` slots. When the game
+The DLL replaces the game executable's imports of `Direct3DCreate9` and
+`Direct3DCreate9Ex` with lightweight forwarding hooks. Limiting the early
+startup patch to the executable avoids re-entering overlay or compatibility
+DLL initialization. The forwarding hook calls the game's original import, then
+patches only the returned factory object's `CreateDevice`/`CreateDeviceEx`
+slots. When the game
 creates its device, those hooks patch `Present` and `Reset` on that device.
 
 This never creates or releases a D3D factory/device from the injection worker.

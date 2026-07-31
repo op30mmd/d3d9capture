@@ -335,9 +335,8 @@ static void PatchModuleImports(HMODULE module)
 {
     if (!module || module == g_ThisModule) return;
 
-    // d3d9.dll has imports used by its own implementation.  Hooking those can
-    // re-enter the runtime while it is still establishing its internal state;
-    // only application/proxy imports are valid interception points.
+    // d3d9.dll has imports used by its own implementation. Hooking those can
+    // re-enter the runtime while it is still establishing its internal state.
     char modulePath[MAX_PATH] = {};
     GetModuleFileNameA(module, modulePath, MAX_PATH);
     const char* moduleName = strrchr(modulePath, '\\');
@@ -402,27 +401,24 @@ static void PatchModuleImports(HMODULE module)
 
 static void HookDirect3D9Factory()
 {
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-    if (snapshot == INVALID_HANDLE_VALUE)
-    {
-        Log("[dll] Could not enumerate modules: %lu", GetLastError());
-        return;
-    }
+    // Restrict the early-startup hook to the executable's import table.  A
+    // process can contain overlays, compatibility layers, and D3D helper DLLs
+    // which also import Direct3DCreate9 while establishing their own loader
+    // state.  Hooking those secondary imports can re-enter their initialization
+    // path and crash the title before its main thread starts.  GTA IV imports
+    // D3D9 from its executable, which is the stable interception point.
+    HMODULE executable = GetModuleHandleA(nullptr);
+    char executablePath[MAX_PATH] = {};
+    GetModuleFileNameA(executable, executablePath, MAX_PATH);
+    Log("[hook] Scanning executable import table only: %s (%p)", executablePath, executable);
+    PatchModuleImports(executable);
 
-    MODULEENTRY32 entry = {};
-    entry.dwSize = sizeof(entry);
-    if (Module32First(snapshot, &entry))
-    {
-        do { PatchModuleImports(entry.hModule); }
-        while (Module32Next(snapshot, &entry));
-    }
-    CloseHandle(snapshot);
     const unsigned long seen = g_FactoryImportsSeen.load();
     const unsigned long patched = g_FactoryImportsPatched.load();
     Log("[hook] Factory import scan complete: d3d9 import descriptors=%lu patched slots=%lu", seen, patched);
     if (!patched)
-        Log("[hook] No normal Direct3DCreate9 imports found. The game may use GetProcAddress, "
-            "a delay-load import, or may have already initialized D3D9 before injection.");
+        Log("[hook] No Direct3DCreate9 import in the executable. This title may use GetProcAddress, "
+            "a proxy DLL, or a delay-load import; no secondary module is patched during startup.");
 }
 
 // ── worker thread ─────────────────────────────────────────────────────────────
