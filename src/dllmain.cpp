@@ -116,6 +116,7 @@ static std::mutex        g_HookMtx;
 static std::atomic<bool> g_DeviceHooked{ false };
 static std::atomic<unsigned long> g_FactoryImportsPatched{ 0 };
 static std::atomic<unsigned long> g_FactoryImportsSeen{ 0 };
+static HINSTANCE g_ThisModule = nullptr;
 
 // ── vtable patcher ────────────────────────────────────────────────────────────
 static bool PatchVTable(void** ppSlot, void* pNew, void** ppOld)
@@ -298,9 +299,11 @@ static void InstallFactoryHooks(IDirect3D9* pD3D, bool isEx)
 static IDirect3D9* WINAPI Hooked_Direct3DCreate9(UINT sdkVersion)
 {
     PFN_Direct3DCreate9 original = g_OrigDirect3DCreate9;
+    Log("[hook] Direct3DCreate9 intercepted sdk=%u original=%p", sdkVersion, original);
     if (!original) return nullptr;
 
     IDirect3D9* d3d = original(sdkVersion);
+    Log("[hook] Direct3DCreate9 returned factory=%p", d3d);
     InstallFactoryHooks(d3d, false);
     return d3d;
 }
@@ -308,9 +311,12 @@ static IDirect3D9* WINAPI Hooked_Direct3DCreate9(UINT sdkVersion)
 static HRESULT WINAPI Hooked_Direct3DCreate9Ex(UINT sdkVersion, IDirect3D9Ex** ppD3D)
 {
     PFN_Direct3DCreate9Ex original = g_OrigDirect3DCreate9Ex;
+    Log("[hook] Direct3DCreate9Ex intercepted sdk=%u original=%p out=%p", sdkVersion, original, ppD3D);
     if (!original) return E_FAIL;
 
     HRESULT hr = original(sdkVersion, ppD3D);
+    Log("[hook] Direct3DCreate9Ex returned hr=0x%08lX factory=%p", hr,
+        (ppD3D ? *ppD3D : nullptr));
     if (SUCCEEDED(hr) && ppD3D)
         InstallFactoryHooks(*ppD3D, true);
     return hr;
@@ -327,7 +333,21 @@ static bool IsD3D9Import(const char* moduleName)
 // and avoids GTA IV's initialization deadlock.
 static void PatchModuleImports(HMODULE module)
 {
-    if (!module) return;
+    if (!module || module == g_ThisModule) return;
+
+    // d3d9.dll has imports used by its own implementation.  Hooking those can
+    // re-enter the runtime while it is still establishing its internal state;
+    // only application/proxy imports are valid interception points.
+    char modulePath[MAX_PATH] = {};
+    GetModuleFileNameA(module, modulePath, MAX_PATH);
+    const char* moduleName = strrchr(modulePath, '\\');
+    moduleName = moduleName ? moduleName + 1 : modulePath;
+    if (_stricmp(moduleName, "d3d9.dll") == 0)
+    {
+        Log("[hook] Skipping D3D9 runtime's own import table: %p", module);
+        return;
+    }
+
     auto base = reinterpret_cast<unsigned char*>(module);
     auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
@@ -424,7 +444,8 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
     switch (reason)
     {
     case DLL_PROCESS_ATTACH:
-        Log("[dll] DllMain(DLL_PROCESS_ATTACH)");
+        g_ThisModule = hInst;
+        Log("[dll] DllMain(DLL_PROCESS_ATTACH), module=%p", hInst);
         DisableThreadLibraryCalls(hInst);
         CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
         break;
