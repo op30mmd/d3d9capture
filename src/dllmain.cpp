@@ -490,13 +490,32 @@ static void HookDirect3D9Factory()
 }
 
 // ── worker thread ─────────────────────────────────────────────────────────────
+static void SignalInjectorReady()
+{
+    char name[96] = {};
+    _snprintf_s(name, sizeof(name), _TRUNCATE, "Local\\d3d9capture-ready-%lu", GetCurrentProcessId());
+    HANDLE event = OpenEventA(EVENT_MODIFY_STATE, FALSE, name);
+    if (event)
+    {
+        SetEvent(event);
+        CloseHandle(event);
+        Log("[dll] Signalled injector readiness event");
+    }
+}
+
 static DWORD WINAPI WorkerThread(LPVOID)
 {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     Log("[dll] WorkerThread started");
-    // Install immediately.  Waiting here loses games which construct D3D9
+    // Install immediately. Waiting here loses games which construct D3D9
     // during startup, and calling Direct3DCreate9 ourselves to catch up is the
     // GTA IV deadlock that this implementation avoids.
     Capture_Init();
+
+    // The suspended-launch injector waits for this acknowledgement before it
+    // resumes the game's primary thread. That removes the race between DLL
+    // loading and scheduling this worker.
+    SignalInjectorReady();
     HookDirect3D9Factory();
 
     return 0;

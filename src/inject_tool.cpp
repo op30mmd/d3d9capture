@@ -172,6 +172,16 @@ static bool Inject(DWORD pid, const char* dllPath)
     return exitCode != 0;
 }
 
+static HANDLE CreateCaptureReadyEvent(DWORD pid)
+{
+    char name[96] = {};
+    _snprintf_s(name, sizeof(name), _TRUNCATE, "Local\\d3d9capture-ready-%lu", pid);
+    HANDLE event = CreateEventA(nullptr, TRUE, FALSE, name);
+    if (!event)
+        printf("[inject] CreateEvent(%s) failed: %lu\n", name, GetLastError());
+    return event;
+}
+
 // ── entry point ───────────────────────────────────────────────────────────────
 int main(int argc, char* argv[])
 {
@@ -228,10 +238,32 @@ int main(int argc, char* argv[])
             return 1;
         }
 
+        HANDLE readyEvent = CreateCaptureReadyEvent(pi.dwProcessId);
+        if (!readyEvent)
+        {
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return 1;
+        }
+
         const bool injected = Inject(pi.dwProcessId, dllPath);
         if (!injected)
         {
             printf("[inject] Injection failed; terminating suspended process.\n");
+            CloseHandle(readyEvent);
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return 1;
+        }
+
+        printf("[inject] Waiting for capture worker readiness ...\n");
+        const DWORD readyWait = WaitForSingleObject(readyEvent, 5000);
+        CloseHandle(readyEvent);
+        if (readyWait != WAIT_OBJECT_0)
+        {
+            printf("[inject] Capture worker did not become ready (wait=%lu); refusing to resume.\n", readyWait);
             TerminateProcess(pi.hProcess, 1);
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
