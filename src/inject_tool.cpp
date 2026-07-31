@@ -3,6 +3,7 @@
  *
  * Usage:
  *   inject_tool.exe  <pid | process-name>  <full-path-to-dll>
+ *   inject_tool.exe  --launch <game.exe> <full-path-to-dll> [-- game arguments]
  *
  * Build:
  *   cl /nologo /W3 /O2 /MT /Fe:inject_tool.exe inject_tool.cpp
@@ -120,8 +121,15 @@ static bool Inject(DWORD pid, const char* dllPath)
     }
 
     HMODULE hKernel = GetModuleHandleA("kernel32.dll");
-    LPTHREAD_START_ROUTINE pfnLoadLib =
-        (LPTHREAD_START_ROUTINE)GetProcAddress(hKernel, "LoadLibraryA");
+    LPTHREAD_START_ROUTINE pfnLoadLib = hKernel
+        ? (LPTHREAD_START_ROUTINE)GetProcAddress(hKernel, "LoadLibraryA") : nullptr;
+    if (!pfnLoadLib)
+    {
+        printf("[inject] Could not resolve LoadLibraryA: %lu\n", GetLastError());
+        VirtualFreeEx(hProc, pRemote, 0, MEM_RELEASE);
+        CloseHandle(hProc);
+        return false;
+    }
 
     printf("[inject] Creating remote thread → LoadLibraryA(\"%s\") ...\n", dllPath);
 
@@ -136,10 +144,25 @@ static bool Inject(DWORD pid, const char* dllPath)
         return false;
     }
 
-    WaitForSingleObject(hThread, 10000);
+    const DWORD wait = WaitForSingleObject(hThread, 10000);
+    if (wait != WAIT_OBJECT_0)
+    {
+        printf("[inject] LoadLibraryA did not finish within 10 seconds (wait=%lu).\n", wait);
+        CloseHandle(hThread);
+        // Do not free pRemote: the target thread may still read the DLL path.
+        CloseHandle(hProc);
+        return false;
+    }
 
     DWORD exitCode = 0;
-    GetExitCodeThread(hThread, &exitCode);
+    if (!GetExitCodeThread(hThread, &exitCode))
+    {
+        printf("[inject] GetExitCodeThread failed: %lu\n", GetLastError());
+        CloseHandle(hThread);
+        VirtualFreeEx(hProc, pRemote, 0, MEM_RELEASE);
+        CloseHandle(hProc);
+        return false;
+    }
     printf("[inject] LoadLibraryA returned module handle: 0x%08lX\n", exitCode);
 
     CloseHandle(hThread);
@@ -152,13 +175,82 @@ static bool Inject(DWORD pid, const char* dllPath)
 // ── entry point ───────────────────────────────────────────────────────────────
 int main(int argc, char* argv[])
 {
-    if (argc != 3)
+    const bool launchMode = argc >= 4 && strcmp(argv[1], "--launch") == 0;
+    if ((!launchMode && argc != 3) || (launchMode && argc < 4))
     {
-        printf("Usage: inject_tool.exe <pid | process.exe>  <C:\\full\\path\\to\\d3d9capture.dll>\n");
+        printf("Usage:\n");
+        printf("  inject_tool.exe <pid | process.exe> <full-path-to-dll>\n");
+        printf("  inject_tool.exe --launch <game.exe> <full-path-to-dll> [-- game arguments]\n");
         return 1;
     }
 
     EnableDebugPrivilege();
+
+    // --launch creates the game with its primary thread suspended, injects
+    // before any game code can create D3D9, then resumes it.  This is the
+    // reliable companion to the GTA-IV-safe factory-import hook.
+    if (launchMode)
+    {
+        char dllPath[MAX_PATH] = {};
+        if (!GetFullPathNameA(argv[3], MAX_PATH, dllPath, nullptr) ||
+            GetFileAttributesA(dllPath) == INVALID_FILE_ATTRIBUTES)
+        {
+            printf("[inject] DLL not found: %s\n", argv[3]);
+            return 1;
+        }
+
+        char gamePath[MAX_PATH] = {};
+        if (!GetFullPathNameA(argv[2], MAX_PATH, gamePath, nullptr))
+        {
+            printf("[inject] Could not resolve game path.\n");
+            return 1;
+        }
+
+        // CreateProcess may modify the command-line buffer.  Keep the game
+        // path quoted and pass optional arguments exactly as supplied.
+        char commandLine[8192] = {};
+        _snprintf_s(commandLine, sizeof(commandLine), _TRUNCATE, "\"%s\"", gamePath);
+        for (int i = 4; i < argc; ++i)
+        {
+            if (strcmp(argv[i], "--") == 0 && i == 4) continue;
+            strncat_s(commandLine, sizeof(commandLine), " ", _TRUNCATE);
+            strncat_s(commandLine, sizeof(commandLine), argv[i], _TRUNCATE);
+        }
+
+        STARTUPINFOA si = {};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi = {};
+        printf("[inject] Launching suspended: %s\n", commandLine);
+        if (!CreateProcessA(gamePath, commandLine, nullptr, nullptr, FALSE,
+                            CREATE_SUSPENDED, nullptr, nullptr, &si, &pi))
+        {
+            printf("[inject] CreateProcess failed: %lu\n", GetLastError());
+            return 1;
+        }
+
+        const bool injected = Inject(pi.dwProcessId, dllPath);
+        if (!injected)
+        {
+            printf("[inject] Injection failed; terminating suspended process.\n");
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return 1;
+        }
+
+        if (ResumeThread(pi.hThread) == static_cast<DWORD>(-1))
+        {
+            printf("[inject] ResumeThread failed: %lu\n", GetLastError());
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return 1;
+        }
+        printf("[inject] SUCCESS: resumed PID %lu after injection.\n", pi.dwProcessId);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return 0;
+    }
 
     // Resolve PID: if the argument is purely digits treat it as a PID directly,
     // otherwise search by process name.

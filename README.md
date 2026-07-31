@@ -86,10 +86,15 @@ Outputs land in `d3d9capture\bin\`.
 :: Terminal 1 — start the frame reader first
 shm_reader.exe
 
-:: Terminal 2 — launch the game, then inject
-inject_tool.exe  game.exe  C:\path\to\d3d9capture.dll
+:: Terminal 2 — recommended: launch suspended, inject, then resume automatically
+inject_tool.exe --launch C:\Games\GTAIV\GTAIV.exe C:\path\to\d3d9capture.dll
+:: Optional game arguments follow `--`:
+inject_tool.exe --launch C:\Games\GTAIV\GTAIV.exe C:\path\to\d3d9capture.dll -- -windowed
+
+:: Existing process support (only works if D3D9 has not initialized yet):
+inject_tool.exe game.exe C:\path\to\d3d9capture.dll
 :: or by PID:
-inject_tool.exe  1234     C:\path\to\d3d9capture.dll
+inject_tool.exe 1234 C:\path\to\d3d9capture.dll
 ```
 
 The first `DUMP_FRAMES` (default: 10) frames are saved as BMP files to
