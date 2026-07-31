@@ -100,6 +100,17 @@ The first `DUMP_FRAMES` (default: 10) frames are saved as BMP files to
 > probe D3D object to attach to an already-created device, because doing that
 > during GTA IV initialization can deadlock the game.
 
+### Runtime diagnostics
+
+The DLL writes a timestamped process/thread trace to both the debugger and
+`C:\\d3d9capture\\debug.log`. It records import discovery and patch addresses,
+factory/device creation arguments and HRESULTs, first back-buffer properties,
+capture failures, reset events, and a capture heartbeat every 300 presents.
+Attach DebugView or inspect this file when a title fails to hook. A diagnostic
+saying no normal factory imports were found generally means the title uses
+`GetProcAddress`, delay loading, or D3D9 had already been initialized before
+injection.
+
 ---
 
 ## How the Capture Works

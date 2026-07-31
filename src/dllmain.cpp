@@ -43,18 +43,29 @@
 // ── logging ──────────────────────────────────────────────────────────────────
 void Log(const char* fmt, ...)
 {
-    char buf[1024];
+    char message[1024];
     va_list args;
     va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, args);
+    vsnprintf(message, sizeof(message), fmt, args);
     va_end(args);
 
-    OutputDebugStringA(buf);
+    char line[1200];
+    SYSTEMTIME now = {};
+    GetLocalTime(&now);
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "[%02u:%02u:%02u.%03u pid=%lu tid=%lu] %s",
+        now.wHour, now.wMinute, now.wSecond, now.wMilliseconds,
+        GetCurrentProcessId(), GetCurrentThreadId(), message);
+    OutputDebugStringA(line);
+    OutputDebugStringA("\n");
 
+    // The directory may not exist in a freshly injected process.  Creating it
+    // here makes the on-disk trace useful even when no frame is captured.
+    CreateDirectoryA("C:\\d3d9capture", nullptr);
     FILE* f = nullptr;
     if (fopen_s(&f, "C:\\d3d9capture\\debug.log", "a") == 0 && f)
     {
-        fprintf(f, "%s\n", buf);
+        fprintf(f, "%s\n", line);
         fclose(f);
     }
 }
@@ -103,6 +114,8 @@ static PFN_ResetEx         g_OrigResetEx        = nullptr;
 
 static std::mutex        g_HookMtx;
 static std::atomic<bool> g_DeviceHooked{ false };
+static std::atomic<unsigned long> g_FactoryImportsPatched{ 0 };
+static std::atomic<unsigned long> g_FactoryImportsSeen{ 0 };
 
 // ── vtable patcher ────────────────────────────────────────────────────────────
 static bool PatchVTable(void** ppSlot, void* pNew, void** ppOld)
@@ -112,7 +125,10 @@ static bool PatchVTable(void** ppSlot, void* pNew, void** ppOld)
 
     DWORD oldProt = 0;
     if (!VirtualProtect(ppSlot, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProt))
+    {
+        Log("[hook] VirtualProtect(%p) failed: %lu", ppSlot, GetLastError());
         return false;
+    }
 
     // An aligned pointer exchange is atomic on Windows.  This prevents another
     // thread from observing a partially-written import/vtable entry.
@@ -174,7 +190,9 @@ static void InstallDeviceHooks(IDirect3DDevice9* pDev, bool bIsEx)
     std::lock_guard<std::mutex> lk(g_HookMtx);
     if (g_DeviceHooked.load()) return;
 
-    Log("[dll] Installing device hooks (bIsEx=%d) ...", bIsEx);
+    Log("[hook] Installing device hooks device=%p vtable=%p isEx=%d ...", pDev,
+        pDev ? *reinterpret_cast<void***>(pDev) : nullptr, bIsEx);
+    if (!pDev) return;
 
     void** vtbl = *reinterpret_cast<void***>(pDev);
     bool ok = true;
@@ -213,9 +231,17 @@ static HRESULT WINAPI Hooked_CreateDevice(
     D3DPRESENT_PARAMETERS*  pPP,
     IDirect3DDevice9**      ppDevice)
 {
-    Log("[dll] Hooked_CreateDevice called");
+    Log("[hook] CreateDevice factory=%p adapter=%u type=%u hwnd=%p flags=0x%08lX pp=%p",
+        pD3D, Adapter, static_cast<unsigned>(DeviceType), hFocusWindow, BehaviorFlags, pPP);
+    if (!g_OrigCreateDevice)
+    {
+        Log("[hook] CreateDevice has no original trampoline");
+        return D3DERR_INVALIDCALL;
+    }
     HRESULT hr = g_OrigCreateDevice(
         pD3D, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPP, ppDevice);
+    Log("[hook] CreateDevice returned hr=0x%08lX device=%p", hr,
+        (ppDevice ? *ppDevice : nullptr));
 
     if (SUCCEEDED(hr) && ppDevice && *ppDevice)
         InstallDeviceHooks(*ppDevice, false);
@@ -233,9 +259,17 @@ static HRESULT WINAPI Hooked_CreateDeviceEx(
     D3DDISPLAYMODEEX*       pOutMode,
     IDirect3DDevice9**      ppDevice)
 {
-    Log("[dll] Hooked_CreateDeviceEx called");
+    Log("[hook] CreateDeviceEx factory=%p adapter=%u type=%u hwnd=%p flags=0x%08lX pp=%p mode=%p",
+        pD3D, Adapter, static_cast<unsigned>(DeviceType), hFocusWindow, BehaviorFlags, pPP, pOutMode);
+    if (!g_OrigCreateDeviceEx)
+    {
+        Log("[hook] CreateDeviceEx has no original trampoline");
+        return D3DERR_INVALIDCALL;
+    }
     HRESULT hr = g_OrigCreateDeviceEx(
         pD3D, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPP, pOutMode, ppDevice);
+    Log("[hook] CreateDeviceEx returned hr=0x%08lX device=%p", hr,
+        (ppDevice ? *ppDevice : nullptr));
 
     if (SUCCEEDED(hr) && ppDevice && *ppDevice)
         InstallDeviceHooks(*ppDevice, true);
@@ -308,6 +342,7 @@ static void PatchModuleImports(HMODULE module)
     for (; desc->Name; ++desc)
     {
         if (!IsD3D9Import(reinterpret_cast<const char*>(base + desc->Name))) continue;
+        g_FactoryImportsSeen.fetch_add(1);
 
         auto firstThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
         auto nameThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base +
@@ -329,7 +364,18 @@ static void PatchModuleImports(HMODULE module)
                 original = reinterpret_cast<void**>(&g_OrigDirect3DCreate9Ex);
             }
             if (replacement)
-                PatchVTable(reinterpret_cast<void**>(&firstThunk->u1.Function), replacement, original);
+            {
+                if (PatchVTable(reinterpret_cast<void**>(&firstThunk->u1.Function), replacement, original))
+                {
+                    g_FactoryImportsPatched.fetch_add(1);
+                    Log("[hook] Patched %s import in module=%p slot=%p original=%p",
+                        import->Name, module, &firstThunk->u1.Function, *original);
+                }
+                else
+                {
+                    Log("[hook] Failed to patch %s import in module=%p", import->Name, module);
+                }
+            }
         }
     }
 }
@@ -351,7 +397,12 @@ static void HookDirect3D9Factory()
         while (Module32Next(snapshot, &entry));
     }
     CloseHandle(snapshot);
-    Log("[dll] Installed D3D9 factory import hooks");
+    const unsigned long seen = g_FactoryImportsSeen.load();
+    const unsigned long patched = g_FactoryImportsPatched.load();
+    Log("[hook] Factory import scan complete: d3d9 import descriptors=%lu patched slots=%lu", seen, patched);
+    if (!patched)
+        Log("[hook] No normal Direct3DCreate9 imports found. The game may use GetProcAddress, "
+            "a delay-load import, or may have already initialized D3D9 before injection.");
 }
 
 // ── worker thread ─────────────────────────────────────────────────────────────
