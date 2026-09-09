@@ -45,6 +45,13 @@ struct ShmHeader
     UINT32  stride;
     UINT32  format;    // D3DFORMAT value
     UINT64  frameIdx;
+    // QueryPerformanceCounter value at capture time. Required for video:
+    // frameIdx counts *captured* frames, not presented ones, so consecutive
+    // indices can be arbitrarily far apart in wall-clock time whenever the
+    // consumer is not asking for every frame. Encoding those at a constant
+    // rate would silently play back at the wrong speed. QPC frequency is
+    // system-wide, so the reader can obtain it itself.
+    UINT64  timestampQpc;
     UINT32  dataOffset; // bytes from start of mapping to first pixel byte
 };
 #pragma pack(pop)
@@ -195,6 +202,10 @@ void Capture_FrameReady(const FrameData& f)
             hdr->format     = static_cast<UINT32>(f.format);
             hdr->frameIdx   = f.frameIdx;
             hdr->dataOffset = sizeof(ShmHeader);
+
+            LARGE_INTEGER qpc = {};
+            QueryPerformanceCounter(&qpc);
+            hdr->timestampQpc = static_cast<UINT64>(qpc.QuadPart);
 
             BYTE* dst = static_cast<BYTE*>(g_pView) + sizeof(ShmHeader);
 

@@ -81,6 +81,12 @@ int main(int argc, char* argv[])
         // A changing colour makes captured frames easy to tell apart.
         const D3DCOLOR colour = D3DCOLOR_XRGB((frame * 3) & 0xFF, 64, 128);
         dev->Clear(0, nullptr, D3DCLEAR_TARGET, colour, 1.0f, 0);
+
+        // An asymmetric marker in the TOP-LEFT corner. A flat colour cannot
+        // reveal a vertical flip, which is the classic way a capture or encode
+        // path goes wrong while still looking plausible.
+        const D3DRECT marker = { 0, 0, 80, 40 };
+        dev->Clear(1, &marker, D3DCLEAR_TARGET, D3DCOLOR_XRGB(255, 255, 255), 1.0f, 0);
         dev->BeginScene();
         dev->EndScene();
         dev->Present(nullptr, nullptr, nullptr, nullptr);

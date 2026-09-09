@@ -56,8 +56,11 @@ directly from the GPU's back-buffer immediately after the game draws them.
 | `capture.h/cpp` | Double-buffered GPU readback via `GetRenderTargetData` |
 | `consumer_backend.cpp` | Writes frames to named shared memory; optional BMP debug dumps |
 | `inject_tool.cpp` | `CreateRemoteThread` injector; accepts PID or process name |
-| `shm_reader.cpp` | Out-of-process frame consumer template |
+| `shm_reader.cpp` | Out-of-process frame consumer; records H.264 MP4 via Media Foundation |
 | `build.bat` | MSVC build script |
+| `tools/d3d9_testapp.cpp` | Minimal D3D9 app used as a verification target |
+| `tools/mp4_frame.cpp` | Decodes frames from a recorded MP4 back to BMP, to verify output |
+| `tools/frida/` | Scripts that verify the hooks inside a live process |
 
 ---
 
@@ -86,6 +89,9 @@ Outputs land in `d3d9capture\bin\`.
 :: Terminal 1 — start the frame reader first
 shm_reader.exe
 
+:: ...or record straight to an H.264 MP4
+shm_reader.exe --record out.mp4 --fps 30 --bitrate 12000
+
 :: Terminal 2 — recommended: launch suspended, inject, then resume automatically
 inject_tool.exe --launch C:\Games\GTAIV\GTAIV.exe C:\path\to\d3d9capture.dll
 :: Optional game arguments follow `--`:
@@ -99,6 +105,38 @@ inject_tool.exe 1234 C:\path\to\d3d9capture.dll
 
 The first `DUMP_FRAMES` (default: 10) frames are saved as BMP files to
 `C:\d3d9capture\` for verification.
+
+### Recording video
+
+`shm_reader --record` encodes delivered frames to H.264/MP4 with Media
+Foundation, which ships with Windows: no third-party dependency, no bundled
+encoder, and a hardware encoder is used when the GPU offers one.
+
+| Flag | Meaning |
+|---|---|
+| `--record <file.mp4>` | Encode delivered frames to H.264/MP4 |
+| `--fps N` | Frames per second to request and encode (default 30) |
+| `--bitrate KBPS` | Target bitrate in kbit/s (default 8000) |
+| `--save N [dir]` | Also write the first N delivered frames as BMPs |
+| `--seconds S` | Stop after S seconds |
+
+Because the DLL only captures while a reader is waiting for a frame, `--fps`
+throttles the *game's* readback cost, not just the reader's work: asking for 30
+fps means the game pays the readback 30 times a second rather than on every
+presented frame.
+
+Each frame carries the `QueryPerformanceCounter` value from the moment it was
+captured, and those timestamps drive the encoded sample times. This matters
+because `frameIdx` counts captured frames rather than presented ones, so
+consecutive frames can be arbitrarily far apart in real time; encoding them at a
+fixed cadence would play back at the wrong speed.
+
+To check a recording is actually correct — a vertical flip or a red/blue swap
+still produces a file that plays fine — decode a frame back out:
+
+```bat
+mp4_frame.exe out.mp4 frame 3 90    :: 3 frames, skipping the first 90
+```
 
 > **Injection timing:** inject before the game creates its D3D9 factory (for
 > example, immediately after launch). The hook intentionally does not create a
