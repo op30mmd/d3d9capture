@@ -45,8 +45,9 @@ echo  Build succeeded.  Outputs in %OUTDIR%
 echo.
 echo  Usage:
 echo    1. Run shm_reader.exe  (opens the shared-memory channel)
-echo    2. Start the game
-echo    3. inject_tool.exe  ^<pid^>  %OUTDIR%\d3d9capture.dll
+echo       or shm_reader.exe --record out.mp4  to encode H.264/MP4
+echo    2. Launch and inject before D3D9 initializes:
+echo       inject_tool.exe --launch ^<game.exe^> %OUTDIR%\d3d9capture.dll
 echo ============================================================
 goto end
 

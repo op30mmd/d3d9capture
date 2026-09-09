@@ -45,6 +45,13 @@ struct ShmHeader
     UINT32  stride;
     UINT32  format;    // D3DFORMAT value
     UINT64  frameIdx;
+    // QueryPerformanceCounter value at capture time. Required for video:
+    // frameIdx counts *captured* frames, not presented ones, so consecutive
+    // indices can be arbitrarily far apart in wall-clock time whenever the
+    // consumer is not asking for every frame. Encoding those at a constant
+    // rate would silently play back at the wrong speed. QPC frequency is
+    // system-wide, so the reader can obtain it itself.
+    UINT64  timestampQpc;
     UINT32  dataOffset; // bytes from start of mapping to first pixel byte
 };
 #pragma pack(pop)
@@ -55,6 +62,9 @@ static void*              g_pView       = nullptr;
 static HANDLE             g_hEvtReady   = nullptr;  // signalled when frame written
 static HANDLE             g_hEvtDone    = nullptr;  // signalled by reader when done
 static std::atomic<int>   g_DumpCount   { 0 };
+// Set when Capture_WantsFrame() has consumed the reader's "done" signal, so
+// Capture_FrameReady knows a reader is waiting without testing the event twice.
+static std::atomic<bool>  g_ReaderArmed { false };
 static char               g_DumpDir[MAX_PATH] = "C:\\d3d9capture\\";
 
 // ── BMP writer ────────────────────────────────────────────────────────────────
@@ -149,6 +159,26 @@ void Capture_Shutdown()
 }
 
 /**
+ * Called on the render thread before each candidate frame, to decide whether
+ * the expensive GPU->CPU readback is worth doing at all.
+ */
+bool Capture_WantsFrame()
+{
+    // The debug dump still wants frames until its quota is used up.
+    if (DUMP_FRAMES > 0 && g_DumpCount.load() < DUMP_FRAMES) return true;
+
+    // Otherwise a frame is only worth capturing if a reader is waiting for one.
+    // The "done" event is auto-reset and only a reader ever re-signals it, so
+    // this doubles as consumer detection and as back-pressure.
+    if (g_pView && g_hEvtDone && WaitForSingleObject(g_hEvtDone, 0) == WAIT_OBJECT_0)
+    {
+        g_ReaderArmed.store(true);
+        return true;
+    }
+    return false;
+}
+
+/**
  * Called on the render thread for every captured frame.
  * Keep this fast — the capture mutex is held for the duration.
  */
@@ -158,11 +188,12 @@ void Capture_FrameReady(const FrameData& f)
     if (!logged) { Log("[con] Capture_FrameReady called (first time)"); logged = true; }
 
     // ── 1. Shared memory delivery ─────────────────────────────────────────
-    if (g_pView && g_hEvtDone)
+    // Capture_WantsFrame() already consumed the reader's "done" signal; do not
+    // wait on it a second time here. The previous code used a 1 ms timeout,
+    // which cost the render thread that full millisecond on every frame
+    // whenever no reader was attached — the normal case.
+    if (g_pView && g_ReaderArmed.exchange(false))
     {
-        // Wait briefly for the reader to finish with the previous frame.
-        // Timeout = 1 ms; if reader is slow we skip to avoid stalling the game.
-        if (WaitForSingleObject(g_hEvtDone, 1) == WAIT_OBJECT_0)
         {
             ShmHeader* hdr = static_cast<ShmHeader*>(g_pView);
             hdr->width      = f.width;
@@ -171,6 +202,10 @@ void Capture_FrameReady(const FrameData& f)
             hdr->format     = static_cast<UINT32>(f.format);
             hdr->frameIdx   = f.frameIdx;
             hdr->dataOffset = sizeof(ShmHeader);
+
+            LARGE_INTEGER qpc = {};
+            QueryPerformanceCounter(&qpc);
+            hdr->timestampQpc = static_cast<UINT64>(qpc.QuadPart);
 
             BYTE* dst = static_cast<BYTE*>(g_pView) + sizeof(ShmHeader);
 

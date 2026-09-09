@@ -1,0 +1,4 @@
+bin/
+src/*.obj
+src/*.pdb
+build_x86/
