@@ -138,8 +138,14 @@ master graphics context and hooks its wrapper `IDirect3D9::CreateDevice` slot
 at context offset `+0x000`. Each modified slot is made writable with `VirtualProtect`, exchanged
 atomically, and its original function is retained as the forwarding target.
 
-### 2. Present Hook (slot 17)
-`Present` is called exactly once per rendered frame. Inside the hook:
+### 2. Present Hooks (device slot 17 and swap chain slot 3)
+Both are hooked, and hooking both is necessary rather than belt-and-braces:
+many engines never call `IDirect3DDevice9::Present` at all and present through
+the swap chain instead. GTA IV is one of them — measured at 99 swap-chain
+Presents in 3 seconds against 0 on the device. Hooking only the device installs
+cleanly and then captures nothing.
+
+Inside the hook:
 
 ```
 GetBackBuffer(0, 0, MONO, &pBackBuffer)
@@ -152,12 +158,28 @@ GetBackBuffer(0, 0, MONO, &pBackBuffer)
 g_OrigPresent(...)   ← call original to flip to screen
 ```
 
-### 3. Double-Buffering
+### 3. Capture Only on Demand
+The readback below is a synchronous GPU sync point: measured at **6.8 ms per
+frame** at 1280x720 in GTA IV. It used to run on every frame whether or not
+anything was consuming the result, so a game with no reader attached paid that
+cost for frames that were then discarded.
+
+`Capture_WantsFrame()` now gates it. A frame is captured only when the BMP dump
+quota is unused or a reader is waiting for one, which brought idle overhead down
+to **0.03 ms per frame**. With `shm_reader` attached the readback costs about
+15.6 ms per frame, so a consumer that does not need every frame should pace
+itself: the "done" event is what asks for the next frame, so the consumer sets
+the capture rate and no separate throttle is needed.
+
+Note the consequence: with `DUMP_FRAMES = 0` and no reader attached, nothing is
+captured, by design.
+
+### 4. Double-Buffering
 Two staging surfaces alternate between "write" (GPU→CPU DMA in progress) and
 "read" (available to consumer). This hides the DMA latency from the render
 thread.  One frame of latency is introduced — standard for all capture tools.
 
-### 4. Reset Hook (slot 16)
+### 5. Reset Hook (slot 16)
 When the game calls `Reset` (resolution change, alt-tab, fullscreen toggle)
 all `D3DPOOL_DEFAULT` resources are invalidated. Our `D3DPOOL_SYSTEMMEM`
 surfaces are unaffected, but we release them preemptively and re-create on

@@ -36,6 +36,17 @@ void Capture_Shutdown();
 // ── internal helper implemented in capture.cpp, called by Capture_Shutdown() ──
 void Capture_ReleaseSurfaces();
 
+/**
+ * Will anything actually use the next frame?  (consumer_backend.cpp)
+ *
+ * Capturing a frame means a synchronous GPU->CPU readback, which costs several
+ * milliseconds and stalls the pipeline. capture.cpp asks this before paying
+ * that cost, so a game with no consumer attached runs at full speed, and a game
+ * with a slow consumer is throttled to the consumer's pace instead of the
+ * render thread's.
+ */
+bool Capture_WantsFrame();
+
 // ── frame descriptor handed to the consumer backend ──────────────────────────
 struct FrameData
 {

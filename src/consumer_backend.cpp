@@ -55,6 +55,9 @@ static void*              g_pView       = nullptr;
 static HANDLE             g_hEvtReady   = nullptr;  // signalled when frame written
 static HANDLE             g_hEvtDone    = nullptr;  // signalled by reader when done
 static std::atomic<int>   g_DumpCount   { 0 };
+// Set when Capture_WantsFrame() has consumed the reader's "done" signal, so
+// Capture_FrameReady knows a reader is waiting without testing the event twice.
+static std::atomic<bool>  g_ReaderArmed { false };
 static char               g_DumpDir[MAX_PATH] = "C:\\d3d9capture\\";
 
 // ── BMP writer ────────────────────────────────────────────────────────────────
@@ -149,6 +152,26 @@ void Capture_Shutdown()
 }
 
 /**
+ * Called on the render thread before each candidate frame, to decide whether
+ * the expensive GPU->CPU readback is worth doing at all.
+ */
+bool Capture_WantsFrame()
+{
+    // The debug dump still wants frames until its quota is used up.
+    if (DUMP_FRAMES > 0 && g_DumpCount.load() < DUMP_FRAMES) return true;
+
+    // Otherwise a frame is only worth capturing if a reader is waiting for one.
+    // The "done" event is auto-reset and only a reader ever re-signals it, so
+    // this doubles as consumer detection and as back-pressure.
+    if (g_pView && g_hEvtDone && WaitForSingleObject(g_hEvtDone, 0) == WAIT_OBJECT_0)
+    {
+        g_ReaderArmed.store(true);
+        return true;
+    }
+    return false;
+}
+
+/**
  * Called on the render thread for every captured frame.
  * Keep this fast — the capture mutex is held for the duration.
  */
@@ -158,11 +181,12 @@ void Capture_FrameReady(const FrameData& f)
     if (!logged) { Log("[con] Capture_FrameReady called (first time)"); logged = true; }
 
     // ── 1. Shared memory delivery ─────────────────────────────────────────
-    if (g_pView && g_hEvtDone)
+    // Capture_WantsFrame() already consumed the reader's "done" signal; do not
+    // wait on it a second time here. The previous code used a 1 ms timeout,
+    // which cost the render thread that full millisecond on every frame
+    // whenever no reader was attached — the normal case.
+    if (g_pView && g_ReaderArmed.exchange(false))
     {
-        // Wait briefly for the reader to finish with the previous frame.
-        // Timeout = 1 ms; if reader is slow we skip to avoid stalling the game.
-        if (WaitForSingleObject(g_hEvtDone, 1) == WAIT_OBJECT_0)
         {
             ShmHeader* hdr = static_cast<ShmHeader*>(g_pView);
             hdr->width      = f.width;

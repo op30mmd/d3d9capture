@@ -168,6 +168,17 @@ void Capture_OnPresent(IDirect3DDevice9* pDev)
     static bool logged = false;
     if (!logged) { Log("[cap] Capture_OnPresent called (first time), device=%p", pDev); logged = true; }
 
+    // Nothing downstream wants this frame: skip the readback entirely. It is
+    // a synchronous GPU sync point costing several milliseconds per frame, and
+    // paying it to produce a frame that is then discarded is pure loss.
+    if (!Capture_WantsFrame())
+    {
+        if ((presentNumber % 1800) == 0)
+            Log("[cap] idle: presents=%llu, no consumer attached (readback skipped)",
+                static_cast<unsigned long long>(presentNumber));
+        return;
+    }
+
     std::lock_guard<std::mutex> lk(g_CapMtx);
 
     // ── A: get back buffer ───────────────────────────────────────────────────
