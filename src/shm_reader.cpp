@@ -273,18 +273,34 @@ int main(int argc, char* argv[])
 
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
-    // Open the shared objects created by the injected DLL.
-    HANDLE hMap = OpenFileMappingA(FILE_MAP_READ, FALSE, SHM_NAME);
+    // Open the shared objects created by the injected DLL (wait up to 10 seconds).
+    HANDLE hMap = nullptr;
+    printf("[reader] Waiting for shared memory from injected DLL...\n");
+    for (int retry = 0; retry < 100 && !hMap && !g_stop; ++retry)
+    {
+        hMap = OpenFileMappingA(FILE_MAP_READ, FALSE, SHM_NAME);
+        if (!hMap) Sleep(100);
+    }
     if (!hMap) { printf("[reader] No shared memory yet — is the DLL injected?\n"); return 1; }
 
     const void* pView = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
     if (!pView) { CloseHandle(hMap); return 1; }
 
-    HANDLE hReady = OpenEventA(EVENT_ALL_ACCESS, FALSE, EVT_FRAME_READY);
-    HANDLE hDone  = OpenEventA(EVENT_ALL_ACCESS, FALSE, EVT_FRAME_DONE);
+    HANDLE hReady = nullptr;
+    HANDLE hDone  = nullptr;
+    for (int retry = 0; retry < 100 && (!hReady || !hDone) && !g_stop; ++retry)
+    {
+        if (!hReady) hReady = OpenEventA(EVENT_ALL_ACCESS, FALSE, EVT_FRAME_READY);
+        if (!hDone)  hDone  = OpenEventA(EVENT_ALL_ACCESS, FALSE, EVT_FRAME_DONE);
+        if (!hReady || !hDone) Sleep(100);
+    }
     if (!hReady || !hDone)
     {
         printf("[reader] Could not open sync events.\n");
+        if (hReady) CloseHandle(hReady);
+        if (hDone)  CloseHandle(hDone);
+        UnmapViewOfFile(pView);
+        CloseHandle(hMap);
         return 1;
     }
 

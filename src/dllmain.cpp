@@ -33,11 +33,14 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
 #include <atomic>
 #include <mutex>
 #include <tlhelp32.h>
 
 #include "capture.h"
+#include "overlay.h"
 
 #include <cstdio>
 #include <cstdarg>
@@ -165,14 +168,37 @@ static bool PatchVTable(void** ppSlot, void* pNew, void** ppOld)
 static void HookSwapChainPresent(IDirect3DDevice9* pDev);
 
 // ── device-level hooks ────────────────────────────────────────────────────────
+static thread_local bool g_InsidePresent = false;
+static thread_local bool s_DeviceFrameRendered = false;
+static thread_local bool s_SwapChainFrameRendered = false;
+static thread_local bool s_DeviceExFrameRendered = false;
+
 static HRESULT WINAPI Hooked_Present(
     IDirect3DDevice9* pDev,
     const RECT* pSrc, const RECT* pDst, HWND hWnd, const RGNDATA* pDirty)
 {
+    if (g_InsidePresent)
+        return g_OrigPresent(pDev, pSrc, pDst, hWnd, pDirty);
+
+    g_InsidePresent = true;
     static bool logged = false;
     if (!logged) { Log("[dll] Hooked_Present called (first time)"); logged = true; }
-    Capture_OnPresent(pDev);
-    return g_OrigPresent(pDev, pSrc, pDst, hWnd, pDirty);
+
+    if (!s_DeviceFrameRendered && pDev)
+    {
+        Capture_OnPresent(pDev);
+        Overlay_OnPresent(pDev);
+        s_DeviceFrameRendered = true;
+    }
+
+    HRESULT hr = g_OrigPresent(pDev, pSrc, pDst, hWnd, pDirty);
+    if (hr != D3DERR_WASSTILLDRAWING)
+    {
+        s_DeviceFrameRendered = false;
+    }
+
+    g_InsidePresent = false;
+    return hr;
 }
 
 // Many engines never call IDirect3DDevice9::Present at all: they present
@@ -180,25 +206,65 @@ static HRESULT WINAPI Hooked_Present(
 // hooked, its Present fires zero times per frame while the swap chain's fires
 // at the frame rate. Hooking just the device silently captures nothing on such
 // a title, which is exactly the failure this DLL was reported to have.
+//
+// Additionally, GTA IV passes D3DPRESENT_DONOTWAIT and spins in a tight loop
+// calling Present while the GPU is still drawing, returning D3DERR_WASSTILLDRAWING
+// up to hundreds or thousands of times before the swap chain actually flips.
+// Without tracking frame rendering state, the overlay would be drawn and blended
+// repeatedly onto the same backbuffer, causing low-opacity transparency to compound
+// exponentially and flicker violently between frames.
 static HRESULT WINAPI Hooked_SwapChainPresent(
     IDirect3DSwapChain9* pChain,
     const RECT* pSrc, const RECT* pDst, HWND hWnd, const RGNDATA* pDirty, DWORD Flags)
 {
+    if (g_InsidePresent)
+        return g_OrigSwapChainPresent(pChain, pSrc, pDst, hWnd, pDirty, Flags);
+
+    g_InsidePresent = true;
     static bool logged = false;
     if (!logged) { Log("[dll] Hooked_SwapChainPresent called (first time)"); logged = true; }
-    if (g_CaptureDevice) Capture_OnPresent(g_CaptureDevice);
-    return g_OrigSwapChainPresent(pChain, pSrc, pDst, hWnd, pDirty, Flags);
+
+    IDirect3DDevice9* pDev = g_CaptureDevice;
+    if (!pDev && pChain)
+    {
+        if (SUCCEEDED(pChain->GetDevice(&pDev)) && pDev)
+        {
+            g_CaptureDevice = pDev;
+            pDev->Release();
+        }
+    }
+
+    if (!s_SwapChainFrameRendered && g_CaptureDevice)
+    {
+        Capture_OnPresent(g_CaptureDevice);
+        Overlay_OnPresent(g_CaptureDevice);
+        s_SwapChainFrameRendered = true;
+    }
+
+    HRESULT hr = g_OrigSwapChainPresent(pChain, pSrc, pDst, hWnd, pDirty, Flags);
+    if (hr != D3DERR_WASSTILLDRAWING)
+    {
+        s_SwapChainFrameRendered = false;
+    }
+
+    g_InsidePresent = false;
+    return hr;
 }
 
 static HRESULT WINAPI Hooked_Reset(
     IDirect3DDevice9* pDev, D3DPRESENT_PARAMETERS* pPP)
 {
     Log("[dll] Hooked_Reset called");
+    s_DeviceFrameRendered = false;
+    s_SwapChainFrameRendered = false;
+    s_DeviceExFrameRendered = false;
     Capture_OnPreReset();
+    Overlay_OnPreReset();
     HRESULT hr = g_OrigReset(pDev, pPP);
     if (SUCCEEDED(hr))
     {
         Capture_OnPostReset(pDev);
+        Overlay_OnPostReset(pDev);
         HookSwapChainPresent(pDev);
     }
     return hr;
@@ -208,21 +274,44 @@ static HRESULT WINAPI Hooked_PresentEx(
     IDirect3DDevice9Ex* pDev,
     const RECT* pSrc, const RECT* pDst, HWND hWnd, const RGNDATA* pDirty, DWORD Flags)
 {
+    if (g_InsidePresent)
+        return g_OrigPresentEx(pDev, pSrc, pDst, hWnd, pDirty, Flags);
+
+    g_InsidePresent = true;
     static bool logged = false;
     if (!logged) { Log("[dll] Hooked_PresentEx called (first time)"); logged = true; }
-    Capture_OnPresent(pDev);
-    return g_OrigPresentEx(pDev, pSrc, pDst, hWnd, pDirty, Flags);
+
+    if (!s_DeviceExFrameRendered && pDev)
+    {
+        Capture_OnPresent(pDev);
+        Overlay_OnPresent(pDev);
+        s_DeviceExFrameRendered = true;
+    }
+
+    HRESULT hr = g_OrigPresentEx(pDev, pSrc, pDst, hWnd, pDirty, Flags);
+    if (hr != D3DERR_WASSTILLDRAWING)
+    {
+        s_DeviceExFrameRendered = false;
+    }
+
+    g_InsidePresent = false;
+    return hr;
 }
 
 static HRESULT WINAPI Hooked_ResetEx(
     IDirect3DDevice9Ex* pDev, D3DPRESENT_PARAMETERS* pPP, D3DDISPLAYMODEEX* pMode)
 {
     Log("[dll] Hooked_ResetEx called");
+    s_DeviceFrameRendered = false;
+    s_SwapChainFrameRendered = false;
+    s_DeviceExFrameRendered = false;
     Capture_OnPreReset();
+    Overlay_OnPreReset();
     HRESULT hr = g_OrigResetEx(pDev, pPP, pMode);
     if (SUCCEEDED(hr))
     {
         Capture_OnPostReset(pDev);
+        Overlay_OnPostReset(pDev);
         HookSwapChainPresent(pDev);
     }
     return hr;
@@ -329,6 +418,7 @@ static void InstallDeviceHooks(IDirect3DDevice9* pDev, bool bIsEx)
 
     g_CaptureDevice = pDev;
     HookSwapChainPresent(pDev);
+    Overlay_Init(pDev);
     g_DeviceHooked.store(true);
 }
 
@@ -458,10 +548,243 @@ static HRESULT WINAPI Hooked_Direct3DCreate9Ex(UINT sdkVersion, IDirect3D9Ex** p
     return hr;
 }
 
+// ── DirectInput8 hooks ────────────────────────────────────────────────────────
+static std::mutex g_DIMtx;
+
+typedef HRESULT (WINAPI *DirectInput8Create_t)(
+    HINSTANCE hinst,
+    DWORD dwVersion,
+    REFIID riidltf,
+    LPVOID *ppvOut,
+    LPUNKNOWN punkOuter
+);
+static DirectInput8Create_t g_OrigDirectInput8Create = nullptr;
+
+typedef HRESULT (STDMETHODCALLTYPE *DICreateDevice_t)(
+    IDirectInput8A* pDI,
+    REFGUID rguid,
+    LPDIRECTINPUTDEVICE8A *lplpDirectInputDevice,
+    LPUNKNOWN pUnkOuter
+);
+static DICreateDevice_t g_OrigDICreateDevice = nullptr;
+
+typedef HRESULT (STDMETHODCALLTYPE *DIGetDeviceState_t)(
+    IDirectInputDevice8A* pDev,
+    DWORD cbData,
+    LPVOID lpvData
+);
+
+typedef HRESULT (STDMETHODCALLTYPE *DIGetDeviceData_t)(
+    IDirectInputDevice8A* pDev,
+    DWORD cbObjectData,
+    LPDIDEVICEOBJECTDATA rgdod,
+    LPDWORD pdwInOut,
+    DWORD dwFlags
+);
+
+struct HookedDIDevice
+{
+    void** vtbl;
+    DIGetDeviceState_t origState;
+    DIGetDeviceData_t  origData;
+    bool isMouse;
+};
+static HookedDIDevice g_HookedDevices[8] = {};
+static std::atomic<int> g_HookedDevCount{ 0 };
+
+static HRESULT STDMETHODCALLTYPE Hooked_DIGetDeviceState(
+    IDirectInputDevice8A* pDev,
+    DWORD cbData,
+    LPVOID lpvData)
+{
+    void** devVtbl = *reinterpret_cast<void***>(pDev);
+    DIGetDeviceState_t orig = nullptr;
+    bool isMouse = false;
+    int count = g_HookedDevCount.load(std::memory_order_acquire);
+    for (int i = 0; i < count; ++i)
+    {
+        if (g_HookedDevices[i].vtbl == devVtbl)
+        {
+            orig = g_HookedDevices[i].origState;
+            isMouse = g_HookedDevices[i].isMouse;
+            break;
+        }
+    }
+    if (!orig) return DIERR_NOTINITIALIZED;
+
+    HRESULT hr = orig(pDev, cbData, lpvData);
+    if (SUCCEEDED(hr) && Overlay_IsMenuOpen())
+    {
+        if (lpvData && cbData > 0)
+        {
+            if (isMouse && cbData >= sizeof(LONG) * 3)
+            {
+                // In DIMOUSESTATE and DIMOUSESTATE2: offset 0=lX, 4=lY, 8=lZ (wheel)
+                LONG lZ = *reinterpret_cast<const LONG*>(reinterpret_cast<const BYTE*>(lpvData) + 8);
+                if (lZ != 0)
+                {
+                    Overlay_AddMouseWheel(0.0f, static_cast<float>(lZ) / 120.0f);
+                }
+            }
+            ZeroMemory(lpvData, cbData);
+        }
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE Hooked_DIGetDeviceData(
+    IDirectInputDevice8A* pDev,
+    DWORD cbObjectData,
+    LPDIDEVICEOBJECTDATA rgdod,
+    LPDWORD pdwInOut,
+    DWORD dwFlags)
+{
+    void** devVtbl = *reinterpret_cast<void***>(pDev);
+    DIGetDeviceData_t orig = nullptr;
+    bool isMouse = false;
+    int count = g_HookedDevCount.load(std::memory_order_acquire);
+    for (int i = 0; i < count; ++i)
+    {
+        if (g_HookedDevices[i].vtbl == devVtbl)
+        {
+            orig = g_HookedDevices[i].origData;
+            isMouse = g_HookedDevices[i].isMouse;
+            break;
+        }
+    }
+    if (!orig) return DIERR_NOTINITIALIZED;
+
+    HRESULT hr = orig(pDev, cbObjectData, rgdod, pdwInOut, dwFlags);
+    if (SUCCEEDED(hr) && Overlay_IsMenuOpen())
+    {
+        if (pdwInOut && *pdwInOut > 0 && rgdod)
+        {
+            if (isMouse)
+            {
+                for (DWORD i = 0; i < *pdwInOut; ++i)
+                {
+                    // DIMOFS_Z is 8
+                    if (rgdod[i].dwOfs == 8 && rgdod[i].dwData != 0)
+                    {
+                        LONG lZ = static_cast<LONG>(rgdod[i].dwData);
+                        Overlay_AddMouseWheel(0.0f, static_cast<float>(lZ) / 120.0f);
+                    }
+                }
+            }
+            *pdwInOut = 0;
+        }
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE Hooked_DICreateDevice(
+    IDirectInput8A* pDI,
+    REFGUID rguid,
+    LPDIRECTINPUTDEVICE8A *lplpDirectInputDevice,
+    LPUNKNOWN pUnkOuter)
+{
+    HRESULT hr = g_OrigDICreateDevice(pDI, rguid, lplpDirectInputDevice, pUnkOuter);
+    if (SUCCEEDED(hr) && lplpDirectInputDevice && *lplpDirectInputDevice)
+    {
+        IDirectInputDevice8A* pDev = *lplpDirectInputDevice;
+        void** devVtbl = *reinterpret_cast<void***>(pDev);
+        if (devVtbl)
+        {
+            std::lock_guard<std::mutex> lk(g_DIMtx);
+            int count = g_HookedDevCount.load();
+            bool alreadyHooked = false;
+            for (int i = 0; i < count; ++i)
+            {
+                if (g_HookedDevices[i].vtbl == devVtbl)
+                {
+                    alreadyHooked = true;
+                    break;
+                }
+            }
+
+            if (!alreadyHooked && count < 8)
+            {
+                bool isMouse = false;
+                DIDEVCAPS caps = {};
+                caps.dwSize = sizeof(DIDEVCAPS);
+                if (SUCCEEDED(pDev->GetCapabilities(&caps)))
+                {
+                    if (GET_DIDEVICE_TYPE(caps.dwDevType) == DI8DEVTYPE_MOUSE)
+                        isMouse = true;
+                }
+                else if (IsEqualGUID(rguid, GUID_SysMouse) || IsEqualGUID(rguid, GUID_SysMouseEm) || IsEqualGUID(rguid, GUID_SysMouseEm2))
+                {
+                    isMouse = true;
+                }
+
+                void* origState = nullptr;
+                void* origData = nullptr;
+                HookSlot(devVtbl, 9, reinterpret_cast<void*>(Hooked_DIGetDeviceState), &origState);
+                HookSlot(devVtbl, 10, reinterpret_cast<void*>(Hooked_DIGetDeviceData), &origData);
+
+                g_HookedDevices[count].vtbl = devVtbl;
+                g_HookedDevices[count].origState = reinterpret_cast<DIGetDeviceState_t>(origState);
+                g_HookedDevices[count].origData = reinterpret_cast<DIGetDeviceData_t>(origData);
+                g_HookedDevices[count].isMouse = isMouse;
+                g_HookedDevCount.store(count + 1, std::memory_order_release);
+
+                Log("[hook] DirectInput device hooked dev=%p vtable=%p isMouse=%d origState=%p origData=%p",
+                    pDev, devVtbl, isMouse ? 1 : 0, origState, origData);
+            }
+        }
+    }
+    return hr;
+}
+
+static void InstallDirectInputHooks(void* pDI)
+{
+    if (!pDI) return;
+    std::lock_guard<std::mutex> lk(g_DIMtx);
+    void** vtbl = *reinterpret_cast<void***>(pDI);
+    if (!vtbl) return;
+
+    if (vtbl[3] != reinterpret_cast<void*>(Hooked_DICreateDevice))
+    {
+        HookSlot(vtbl, 3, reinterpret_cast<void*>(Hooked_DICreateDevice),
+                 reinterpret_cast<void**>(&g_OrigDICreateDevice));
+        Log("[hook] DirectInput8 CreateDevice hooked pDI=%p vtable=%p orig=%p",
+            pDI, vtbl, reinterpret_cast<void*>(g_OrigDICreateDevice));
+    }
+}
+
+static HRESULT WINAPI Hooked_DirectInput8Create(
+    HINSTANCE hinst,
+    DWORD dwVersion,
+    REFIID riidltf,
+    LPVOID *ppvOut,
+    LPUNKNOWN punkOuter)
+{
+    Log("[hook] DirectInput8Create intercepted version=0x%04lx", dwVersion);
+    if (!g_OrigDirectInput8Create)
+    {
+        Log("[hook] DirectInput8Create has no original trampoline");
+        return DIERR_NOTINITIALIZED;
+    }
+    HRESULT hr = g_OrigDirectInput8Create(hinst, dwVersion, riidltf, ppvOut, punkOuter);
+    Log("[hook] DirectInput8Create returned hr=0x%08lX out=%p", hr,
+        (ppvOut ? *ppvOut : nullptr));
+    if (SUCCEEDED(hr) && ppvOut && *ppvOut)
+    {
+        InstallDirectInputHooks(*ppvOut);
+    }
+    return hr;
+}
+
 static bool IsD3D9Import(const char* moduleName)
 {
     return moduleName && (_stricmp(moduleName, "d3d9.dll") == 0 ||
                           _stricmp(moduleName, "d3d9") == 0);
+}
+
+static bool IsDInput8Import(const char* moduleName)
+{
+    return moduleName && (_stricmp(moduleName, "dinput8.dll") == 0 ||
+                          _stricmp(moduleName, "dinput8") == 0);
 }
 
 // Patch a module's normal PE import table.  We deliberately do not modify D3D9
@@ -477,9 +800,9 @@ static void PatchModuleImports(HMODULE module)
     GetModuleFileNameA(module, modulePath, MAX_PATH);
     const char* moduleName = strrchr(modulePath, '\\');
     moduleName = moduleName ? moduleName + 1 : modulePath;
-    if (_stricmp(moduleName, "d3d9.dll") == 0)
+    if (_stricmp(moduleName, "d3d9.dll") == 0 || _stricmp(moduleName, "dinput8.dll") == 0)
     {
-        Log("[hook] Skipping D3D9 runtime's own import table: %p", module);
+        Log("[hook] Skipping runtime's own import table: %p (%s)", module, moduleName);
         return;
     }
 
@@ -496,8 +819,12 @@ static void PatchModuleImports(HMODULE module)
     auto desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + imports.VirtualAddress);
     for (; desc->Name; ++desc)
     {
-        if (!IsD3D9Import(reinterpret_cast<const char*>(base + desc->Name))) continue;
-        g_FactoryImportsSeen.fetch_add(1);
+        const char* descName = reinterpret_cast<const char*>(base + desc->Name);
+        const bool isD3D9 = IsD3D9Import(descName);
+        const bool isDInput8 = IsDInput8Import(descName);
+        if (!isD3D9 && !isDInput8) continue;
+
+        if (isD3D9) g_FactoryImportsSeen.fetch_add(1);
 
         auto firstThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
         auto nameThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base +
@@ -508,21 +835,32 @@ static void PatchModuleImports(HMODULE module)
             auto import = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + nameThunk->u1.AddressOfData);
             void* replacement = nullptr;
             void** original = nullptr;
-            if (strcmp(reinterpret_cast<const char*>(import->Name), "Direct3DCreate9") == 0)
+            if (isD3D9)
             {
-                replacement = reinterpret_cast<void*>(Hooked_Direct3DCreate9);
-                original = reinterpret_cast<void**>(&g_OrigDirect3DCreate9);
+                if (strcmp(reinterpret_cast<const char*>(import->Name), "Direct3DCreate9") == 0)
+                {
+                    replacement = reinterpret_cast<void*>(Hooked_Direct3DCreate9);
+                    original = reinterpret_cast<void**>(&g_OrigDirect3DCreate9);
+                }
+                else if (strcmp(reinterpret_cast<const char*>(import->Name), "Direct3DCreate9Ex") == 0)
+                {
+                    replacement = reinterpret_cast<void*>(Hooked_Direct3DCreate9Ex);
+                    original = reinterpret_cast<void**>(&g_OrigDirect3DCreate9Ex);
+                }
             }
-            else if (strcmp(reinterpret_cast<const char*>(import->Name), "Direct3DCreate9Ex") == 0)
+            else if (isDInput8)
             {
-                replacement = reinterpret_cast<void*>(Hooked_Direct3DCreate9Ex);
-                original = reinterpret_cast<void**>(&g_OrigDirect3DCreate9Ex);
+                if (strcmp(reinterpret_cast<const char*>(import->Name), "DirectInput8Create") == 0)
+                {
+                    replacement = reinterpret_cast<void*>(Hooked_DirectInput8Create);
+                    original = reinterpret_cast<void**>(&g_OrigDirectInput8Create);
+                }
             }
             if (replacement)
             {
                 if (PatchVTable(reinterpret_cast<void**>(&firstThunk->u1.Function), replacement, original))
                 {
-                    g_FactoryImportsPatched.fetch_add(1);
+                    if (isD3D9) g_FactoryImportsPatched.fetch_add(1);
                     Log("[hook] Patched %s import in module=%p slot=%p original=%p",
                         import->Name, module, &firstThunk->u1.Function, *original);
                 }
@@ -856,7 +1194,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
 }
 
 // ── DllMain ───────────────────────────────────────────────────────────────────
-BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID lpReserved)
 {
     switch (reason)
     {
@@ -872,6 +1210,11 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
     case DLL_PROCESS_DETACH:
         // Process teardown may hold the loader lock. Avoid releasing D3D/IPC
         // resources here; Windows reclaims process resources on termination.
+        // lpReserved is non-null if the process is terminating, null if dynamic unload.
+        if (lpReserved == nullptr)
+        {
+            Overlay_Shutdown();
+        }
         break;
     }
     return TRUE;

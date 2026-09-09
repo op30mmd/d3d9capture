@@ -2,3 +2,4 @@ bin/
 src/*.obj
 src/*.pdb
 build_x86/
+saved_bmps/

@@ -19,10 +19,12 @@ if not exist %OUTDIR% mkdir %OUTDIR%
 
 echo.
 echo [1/3] Building d3d9capture.dll ...
-cl /nologo /W3 /O2 /MD /LD ^
+cl /nologo /W3 /O2 /MD /LD /I imgui /I imgui\backends ^
    /Fe:%OUTDIR%\d3d9capture.dll ^
-   dllmain.cpp capture.cpp consumer_backend.cpp ^
-   /link d3d9.lib user32.lib gdi32.lib
+   dllmain.cpp capture.cpp consumer_backend.cpp recorder.cpp overlay.cpp ^
+   imgui\imgui.cpp imgui\imgui_draw.cpp imgui\imgui_widgets.cpp imgui\imgui_tables.cpp imgui\imgui_demo.cpp ^
+   imgui\backends\imgui_impl_win32.cpp imgui_impl_dx9_patched.cpp ^
+   /link d3d9.lib user32.lib gdi32.lib dxguid.lib shell32.lib mfplat.lib mfuuid.lib mfreadwrite.lib ole32.lib
 if errorlevel 1 goto fail
 
 echo.

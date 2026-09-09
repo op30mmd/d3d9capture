@@ -26,8 +26,10 @@
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <mutex>
 
 #include "capture.h"
+#include "recorder.h"
 
 // ── tunables ──────────────────────────────────────────────────────────────────
 static constexpr int   DUMP_FRAMES       = 10;                  // 0 = disabled
@@ -66,6 +68,48 @@ static std::atomic<int>   g_DumpCount   { 0 };
 // Capture_FrameReady knows a reader is waiting without testing the event twice.
 static std::atomic<bool>  g_ReaderArmed { false };
 static char               g_DumpDir[MAX_PATH] = "C:\\d3d9capture\\";
+
+static std::atomic<bool>  g_SnapshotPending{ false };
+static std::atomic<int>   g_DumpQuota{ 0 };
+static char               g_LastScreenshotPath[MAX_PATH] = "";
+static std::mutex         g_ScreenshotMtx;
+
+void Capture_TriggerSnapshot()
+{
+    g_SnapshotPending.store(true);
+}
+
+bool Capture_IsSnapshotPending()
+{
+    return g_SnapshotPending.load();
+}
+
+bool Capture_TakeSnapshotPending()
+{
+    return g_SnapshotPending.exchange(false);
+}
+
+void Capture_SetLastScreenshotPath(const char* path)
+{
+    std::lock_guard<std::mutex> lk(g_ScreenshotMtx);
+    strncpy_s(g_LastScreenshotPath, sizeof(g_LastScreenshotPath), path, _TRUNCATE);
+}
+
+void Capture_GetLastScreenshotPath(char* dst, size_t maxLen)
+{
+    std::lock_guard<std::mutex> lk(g_ScreenshotMtx);
+    strncpy_s(dst, maxLen, g_LastScreenshotPath, _TRUNCATE);
+}
+
+void Capture_SetDumpQuota(int count)
+{
+    g_DumpQuota.store(count);
+}
+
+int Capture_GetDumpQuota()
+{
+    return g_DumpQuota.load();
+}
 
 // ── BMP writer ────────────────────────────────────────────────────────────────
 static bool WriteBmp(const char* path, const FrameData& f)
@@ -149,13 +193,24 @@ void Capture_Init()
     Log("[con] Capture_Init");
     CreateDirectoryA(g_DumpDir, nullptr);
     InitSharedMemory();
+    Recorder_Init();
     // capture.cpp has no init work; surfaces are created lazily on first Present.
 }
 
 void Capture_Shutdown()
 {
+    Recorder_Shutdown();
     ShutdownSharedMemory();
     Capture_ReleaseSurfaces();  // free the D3D staging surfaces owned by capture.cpp
+}
+
+static std::atomic<DWORD> g_LastConsumerActiveTick{ 0 };
+
+bool Capture_IsConsumerActive()
+{
+    DWORD last = g_LastConsumerActiveTick.load();
+    if (last == 0) return false;
+    return (GetTickCount() - last) < 1500;
 }
 
 /**
@@ -164,6 +219,15 @@ void Capture_Shutdown()
  */
 bool Capture_WantsFrame()
 {
+    // Snapshot requested
+    if (g_SnapshotPending.load()) return true;
+
+    // Burst dump requested
+    if (g_DumpQuota.load() > 0) return true;
+
+    // Video Recording active
+    if (Recorder_WantsFrame()) return true;
+
     // The debug dump still wants frames until its quota is used up.
     if (DUMP_FRAMES > 0 && g_DumpCount.load() < DUMP_FRAMES) return true;
 
@@ -173,6 +237,7 @@ bool Capture_WantsFrame()
     if (g_pView && g_hEvtDone && WaitForSingleObject(g_hEvtDone, 0) == WAIT_OBJECT_0)
     {
         g_ReaderArmed.store(true);
+        g_LastConsumerActiveTick.store(GetTickCount());
         return true;
     }
     return false;
@@ -187,6 +252,50 @@ void Capture_FrameReady(const FrameData& f)
     static bool logged = false;
     if (!logged) { Log("[con] Capture_FrameReady called (first time)"); logged = true; }
 
+    // ── Video Recording ───────────────────────────────────────────────────
+    Recorder_OnFrameReady(f.pixels, f.width, f.height, f.stride, f.frameIdx);
+
+    // ── Instant Screenshot ────────────────────────────────────────────────
+    if (Capture_TakeSnapshotPending())
+    {
+        char snapDir[MAX_PATH];
+        _snprintf_s(snapDir, sizeof(snapDir), "%sscreenshots\\", g_DumpDir);
+        CreateDirectoryA(g_DumpDir, nullptr);
+        CreateDirectoryA(snapDir, nullptr);
+
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char snapPath[MAX_PATH];
+        _snprintf_s(snapPath, sizeof(snapPath), "%sshot_%04d%02d%02d_%02d%02d%02d_%03d.bmp",
+                    snapDir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+        if (WriteBmp(snapPath, f))
+        {
+            Log("[con] Screenshot saved to %s", snapPath);
+            Capture_SetLastScreenshotPath(snapPath);
+        }
+        else
+        {
+            Log("[con] Failed to write screenshot BMP: %s", snapPath);
+        }
+    }
+
+    // ── Burst Frame Dump ──────────────────────────────────────────────────
+    int quota = g_DumpQuota.load();
+    if (quota > 0)
+    {
+        g_DumpQuota.fetch_sub(1);
+        char dumpSubDir[MAX_PATH];
+        _snprintf_s(dumpSubDir, sizeof(dumpSubDir), "%sdumps\\", g_DumpDir);
+        CreateDirectoryA(g_DumpDir, nullptr);
+        CreateDirectoryA(dumpSubDir, nullptr);
+
+        char dumpPath[MAX_PATH];
+        _snprintf_s(dumpPath, sizeof(dumpPath), "%sdump_%06llu.bmp",
+                    dumpSubDir, static_cast<unsigned long long>(f.frameIdx));
+        WriteBmp(dumpPath, f);
+    }
+
     // ── 1. Shared memory delivery ─────────────────────────────────────────
     // Capture_WantsFrame() already consumed the reader's "done" signal; do not
     // wait on it a second time here. The previous code used a 1 ms timeout,
@@ -194,6 +303,7 @@ void Capture_FrameReady(const FrameData& f)
     // whenever no reader was attached — the normal case.
     if (g_pView && g_ReaderArmed.exchange(false))
     {
+        g_LastConsumerActiveTick.store(GetTickCount());
         {
             ShmHeader* hdr = static_cast<ShmHeader*>(g_pView);
             hdr->width      = f.width;
@@ -219,7 +329,7 @@ void Capture_FrameReady(const FrameData& f)
         }
     }
 
-    // ── 2. Debug BMP dump ─────────────────────────────────────────────────
+    // ── 2. Initial Debug BMP dump ─────────────────────────────────────────
     if (DUMP_FRAMES > 0)
     {
         int n = g_DumpCount.fetch_add(1);
