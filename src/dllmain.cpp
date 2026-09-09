@@ -11,6 +11,9 @@
  *        ▼
  *   IDirect3DDevice9::Present (slot 17) ← patched on the device vtable.
  *   IDirect3DDevice9::Reset   (slot 16) ← patched on the device vtable.
+ *   IDirect3DSwapChain9::Present (slot 3) ← patched on the implicit swap chain.
+ *        Required, not optional: engines such as GTA IV present through the
+ *        swap chain and never call IDirect3DDevice9::Present at all.
  *
  * Why this fixes GTA IV freezes
  * ──────────────────────────────
@@ -75,6 +78,8 @@ static constexpr int VT_D3D9_CREATEDEVICE    = 16; // IDirect3D9::CreateDevice
 static constexpr int VT_D3D9_CREATEDEVICEEX  = 20; // IDirect3D9Ex::CreateDeviceEx
 static constexpr int VT_DEVICE_RESET         = 16; // IDirect3DDevice9::Reset
 static constexpr int VT_DEVICE_PRESENT       = 17; // IDirect3DDevice9::Present
+static constexpr int VT_DEVICE_GETSWAPCHAIN  = 14; // IDirect3DDevice9::GetSwapChain
+static constexpr int VT_SWAPCHAIN_PRESENT    = 3;  // IDirect3DSwapChain9::Present
 static constexpr int VT_DEVICE_PRESENT_EX    = 121; // IDirect3DDevice9Ex::PresentEx
 static constexpr int VT_DEVICE_RESET_EX      = 132; // IDirect3DDevice9Ex::ResetEx
 
@@ -91,6 +96,9 @@ typedef HRESULT (WINAPI *PFN_Present)(
 
 typedef HRESULT (WINAPI *PFN_Reset)(
     IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+
+typedef HRESULT (WINAPI *PFN_SwapChainPresent)(
+    IDirect3DSwapChain9*, const RECT*, const RECT*, HWND, const RGNDATA*, DWORD);
 
 typedef HRESULT (WINAPI *PFN_PresentEx)(
     IDirect3DDevice9Ex*, const RECT*, const RECT*, HWND, const RGNDATA*, DWORD);
@@ -110,12 +118,23 @@ static PFN_CreateDeviceEx  g_OrigCreateDeviceEx = nullptr;
 static PFN_Present         g_OrigPresent        = nullptr;
 static PFN_PresentEx       g_OrigPresentEx      = nullptr;
 static PFN_Reset           g_OrigReset          = nullptr;
+static PFN_SwapChainPresent g_OrigSwapChainPresent = nullptr;
+// The device whose frames we capture. Needed because a swap chain's Present
+// does not receive the device as an argument.
+static IDirect3DDevice9*   g_CaptureDevice      = nullptr;
 static PFN_ResetEx         g_OrigResetEx        = nullptr;
 
 static std::mutex        g_HookMtx;
 static std::atomic<bool> g_DeviceHooked{ false };
 static std::atomic<unsigned long> g_FactoryImportsPatched{ 0 };
 static std::atomic<unsigned long> g_FactoryImportsSeen{ 0 };
+// Set once our patched import slot is actually called: proof that the game is
+// still ahead of its own device creation and will hand us the device itself.
+static std::atomic<bool> g_FactoryIntercepted{ false };
+// Non-zero while the game is inside the real CreateDevice/CreateDeviceEx. The
+// D3D9 runtime holds internal locks across that call, so the worker thread must
+// not touch any D3D9 object while it is set.
+static std::atomic<int> g_D3D9CallsInFlight{ 0 };
 static HINSTANCE g_ThisModule = nullptr;
 
 // ── vtable patcher ────────────────────────────────────────────────────────────
@@ -143,6 +162,8 @@ static bool PatchVTable(void** ppSlot, void* pNew, void** ppOld)
     return true;
 }
 
+static void HookSwapChainPresent(IDirect3DDevice9* pDev);
+
 // ── device-level hooks ────────────────────────────────────────────────────────
 static HRESULT WINAPI Hooked_Present(
     IDirect3DDevice9* pDev,
@@ -154,6 +175,21 @@ static HRESULT WINAPI Hooked_Present(
     return g_OrigPresent(pDev, pSrc, pDst, hWnd, pDirty);
 }
 
+// Many engines never call IDirect3DDevice9::Present at all: they present
+// through the swap chain instead. GTA IV is one of them — with only the device
+// hooked, its Present fires zero times per frame while the swap chain's fires
+// at the frame rate. Hooking just the device silently captures nothing on such
+// a title, which is exactly the failure this DLL was reported to have.
+static HRESULT WINAPI Hooked_SwapChainPresent(
+    IDirect3DSwapChain9* pChain,
+    const RECT* pSrc, const RECT* pDst, HWND hWnd, const RGNDATA* pDirty, DWORD Flags)
+{
+    static bool logged = false;
+    if (!logged) { Log("[dll] Hooked_SwapChainPresent called (first time)"); logged = true; }
+    if (g_CaptureDevice) Capture_OnPresent(g_CaptureDevice);
+    return g_OrigSwapChainPresent(pChain, pSrc, pDst, hWnd, pDirty, Flags);
+}
+
 static HRESULT WINAPI Hooked_Reset(
     IDirect3DDevice9* pDev, D3DPRESENT_PARAMETERS* pPP)
 {
@@ -161,7 +197,10 @@ static HRESULT WINAPI Hooked_Reset(
     Capture_OnPreReset();
     HRESULT hr = g_OrigReset(pDev, pPP);
     if (SUCCEEDED(hr))
+    {
         Capture_OnPostReset(pDev);
+        HookSwapChainPresent(pDev);
+    }
     return hr;
 }
 
@@ -182,7 +221,10 @@ static HRESULT WINAPI Hooked_ResetEx(
     Capture_OnPreReset();
     HRESULT hr = g_OrigResetEx(pDev, pPP, pMode);
     if (SUCCEEDED(hr))
+    {
         Capture_OnPostReset(pDev);
+        HookSwapChainPresent(pDev);
+    }
     return hr;
 }
 
@@ -191,23 +233,68 @@ static constexpr size_t VT_D3D9EX_COUNT = 21;     // final Ex slot: CreateDevice
 static constexpr size_t VT_DEVICE_COUNT = 119;    // final base slot: CreateQuery
 static constexpr size_t VT_DEVICEEX_COUNT = 133;  // final Ex slot: ResetEx
 
-// Many overlays (including the GTA IV D3D wrapper) share a D3D runtime vtable
-// between objects. Never edit that shared read-only table: give only the object
-// we received a private, writable vtable copy. This avoids clobbering ReShade,
-// the system runtime, and other device users.
-static void** CloneObjectVTable(void* object, size_t count)
+// Both factory and device vtables are patched IN PLACE, never relocated to a
+// private copy. That is the opposite of what it looks like it should be, so the
+// reasoning is worth recording — both halves were established by experiment.
+//
+//  * A DEVICE's vtable is per-instance. The Windows D3D9 runtime embeds it in
+//    the device's own allocation (observed at device+0x2F5C). Handing such a
+//    device a relocated copy crashes the process on the first call through it,
+//    before any hook of ours is even reached. Such a table is already private
+//    to the object, so patching it in place affects nothing else.
+//
+//  * A FACTORY's vtable is shared, and copying it looks like the polite thing
+//    to do. It is not. Other hook libraries are already in that table — ReShade,
+//    loaded as the game's d3d9.dll, patches IDirect3D9::CreateDevice in the
+//    shared system vtable in place — and they recover their own trampoline from
+//    the object's vtable POINTER. Point the object at a copy and that lookup
+//    fails against an address they have never seen. GTA IV died inside
+//    CreateDevice this way, while the same clone worked in a test app with no
+//    other overlay present.
+//
+// Patching in place is what every co-resident overlay does, so hooks chain in
+// the order they were installed and each library still finds its own original.
+static bool IsPerInstanceVTable(const void* object, const void* vtable)
 {
-    if (!object || !count) return nullptr;
-    void*** objectVTable = reinterpret_cast<void***>(object);
-    void** original = *objectVTable;
-    if (!original) return nullptr;
+    MEMORY_BASIC_INFORMATION vt = {};
+    if (VirtualQuery(vtable, &vt, sizeof(vt)) == 0) return false;
+    if (vt.Type == MEM_IMAGE) return false;      // part of a module: shared
 
-    void** clone = static_cast<void**>(VirtualAlloc(nullptr, count * sizeof(void*),
-                                                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!clone) return nullptr;
-    memcpy(clone, original, count * sizeof(void*));
-    InterlockedExchangePointer(reinterpret_cast<void* volatile*>(objectVTable), clone);
-    return clone;
+    MEMORY_BASIC_INFORMATION obj = {};
+    if (VirtualQuery(object, &obj, sizeof(obj)) == 0) return false;
+    return obj.AllocationBase == vt.AllocationBase;
+}
+
+// Replace one vtable slot, saving the previous entry as the trampoline.
+static bool HookSlot(void** vtbl, int slot, void* replacement, void** original)
+{
+    *original = vtbl[slot];
+    return PatchVTable(&vtbl[slot], replacement, original);
+}
+
+// Hook the implicit swap chain's Present. Called on the game's own thread right
+// after CreateDevice, and again after a Reset (a Reset recreates the implicit
+// swap chain; when its vtable is per-instance the new object needs re-hooking).
+static void HookSwapChainPresent(IDirect3DDevice9* pDev)
+{
+    if (!pDev) return;
+
+    IDirect3DSwapChain9* chain = nullptr;
+    if (FAILED(pDev->GetSwapChain(0, &chain)) || !chain)
+    {
+        Log("[hook] GetSwapChain(0) failed; swap-chain Present will not be hooked");
+        return;
+    }
+
+    void** vtbl = *reinterpret_cast<void***>(chain);
+    if (vtbl && vtbl[VT_SWAPCHAIN_PRESENT] != reinterpret_cast<void*>(Hooked_SwapChainPresent))
+    {
+        HookSlot(vtbl, VT_SWAPCHAIN_PRESENT, reinterpret_cast<void*>(Hooked_SwapChainPresent),
+                 reinterpret_cast<void**>(&g_OrigSwapChainPresent));
+        Log("[hook] Swap chain Present hooked chain=%p vtable=%p orig=%p",
+            chain, vtbl, reinterpret_cast<void*>(g_OrigSwapChainPresent));
+    }
+    chain->Release();
 }
 
 static void InstallDeviceHooks(IDirect3DDevice9* pDev, bool bIsEx)
@@ -216,27 +303,32 @@ static void InstallDeviceHooks(IDirect3DDevice9* pDev, bool bIsEx)
     if (g_DeviceHooked.load() || !pDev) return;
 
     void** original = *reinterpret_cast<void***>(pDev);
-    Log("[hook] Installing private device hooks device=%p vtable=%p isEx=%d ...", pDev, original, bIsEx);
-    void** vtbl = CloneObjectVTable(pDev, bIsEx ? VT_DEVICEEX_COUNT : VT_DEVICE_COUNT);
-    if (!vtbl)
-    {
-        Log("[hook] FAILED to clone device vtable: %lu", GetLastError());
-        return;
-    }
+    if (!original) return;
 
-    g_OrigPresent = reinterpret_cast<PFN_Present>(vtbl[VT_DEVICE_PRESENT]);
-    g_OrigReset = reinterpret_cast<PFN_Reset>(vtbl[VT_DEVICE_RESET]);
-    vtbl[VT_DEVICE_PRESENT] = reinterpret_cast<void*>(Hooked_Present);
-    vtbl[VT_DEVICE_RESET] = reinterpret_cast<void*>(Hooked_Reset);
+    const bool perInstance = IsPerInstanceVTable(pDev, original);
+    Log("[hook] Installing device hooks device=%p vtable=%p isEx=%d perInstance=%d ...",
+        pDev, original, bIsEx ? 1 : 0, perInstance ? 1 : 0);
+
+    void** vtbl = original;
+
+    HookSlot(vtbl, VT_DEVICE_PRESENT, reinterpret_cast<void*>(Hooked_Present),
+             reinterpret_cast<void**>(&g_OrigPresent));
+    HookSlot(vtbl, VT_DEVICE_RESET, reinterpret_cast<void*>(Hooked_Reset),
+             reinterpret_cast<void**>(&g_OrigReset));
     if (bIsEx)
     {
-        g_OrigPresentEx = reinterpret_cast<PFN_PresentEx>(vtbl[VT_DEVICE_PRESENT_EX]);
-        g_OrigResetEx = reinterpret_cast<PFN_ResetEx>(vtbl[VT_DEVICE_RESET_EX]);
-        vtbl[VT_DEVICE_PRESENT_EX] = reinterpret_cast<void*>(Hooked_PresentEx);
-        vtbl[VT_DEVICE_RESET_EX] = reinterpret_cast<void*>(Hooked_ResetEx);
+        HookSlot(vtbl, VT_DEVICE_PRESENT_EX, reinterpret_cast<void*>(Hooked_PresentEx),
+                 reinterpret_cast<void**>(&g_OrigPresentEx));
+        HookSlot(vtbl, VT_DEVICE_RESET_EX, reinterpret_cast<void*>(Hooked_ResetEx),
+                 reinterpret_cast<void**>(&g_OrigResetEx));
     }
 
-    Log("[hook] Device hooks installed successfully (private vtable=%p)", vtbl);
+    Log("[hook] Device hooks installed in place (vtable=%p, %s) Present orig=%p Reset orig=%p",
+        vtbl, perInstance ? "per-instance table" : "shared table",
+        reinterpret_cast<void*>(g_OrigPresent), reinterpret_cast<void*>(g_OrigReset));
+
+    g_CaptureDevice = pDev;
+    HookSwapChainPresent(pDev);
     g_DeviceHooked.store(true);
 }
 
@@ -258,8 +350,10 @@ static HRESULT WINAPI Hooked_CreateDevice(
         Log("[hook] CreateDevice has no original trampoline");
         return D3DERR_INVALIDCALL;
     }
+    g_D3D9CallsInFlight.fetch_add(1);
     HRESULT hr = g_OrigCreateDevice(
         pD3D, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPP, ppDevice);
+    g_D3D9CallsInFlight.fetch_sub(1);
     Log("[hook] CreateDevice returned hr=0x%08lX device=%p", hr,
         (ppDevice ? *ppDevice : nullptr));
 
@@ -286,8 +380,10 @@ static HRESULT WINAPI Hooked_CreateDeviceEx(
         Log("[hook] CreateDeviceEx has no original trampoline");
         return D3DERR_INVALIDCALL;
     }
+    g_D3D9CallsInFlight.fetch_add(1);
     HRESULT hr = g_OrigCreateDeviceEx(
         pD3D, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPP, pOutMode, ppDevice);
+    g_D3D9CallsInFlight.fetch_sub(1);
     Log("[hook] CreateDeviceEx returned hr=0x%08lX device=%p", hr,
         (ppDevice ? *ppDevice : nullptr));
 
@@ -305,29 +401,39 @@ static HRESULT WINAPI Hooked_CreateDeviceEx(
 // shared with a factory created by this DLL.
 static void InstallFactoryHooks(IDirect3D9* pD3D, bool isEx)
 {
+    std::lock_guard<std::mutex> lk(g_HookMtx);
     if (!pD3D) return;
 
-    void** original = *reinterpret_cast<void***>(pD3D);
-    void** vtbl = CloneObjectVTable(pD3D, isEx ? VT_D3D9EX_COUNT : VT_D3D9_COUNT);
-    if (!vtbl)
+    void** vtbl = *reinterpret_cast<void***>(pD3D);
+    if (!vtbl) return;
+
+    // Re-hooking the same factory would store Hooked_CreateDevice as its own
+    // "original" trampoline and recurse forever on the next call. The polling
+    // path can legitimately see the same factory more than once.
+    if (vtbl[VT_D3D9_CREATEDEVICE] == reinterpret_cast<void*>(Hooked_CreateDevice))
     {
-        Log("[hook] FAILED to clone factory vtable=%p: %lu", original, GetLastError());
+        Log("[hook] Factory %p is already hooked; leaving it alone", pD3D);
         return;
     }
 
-    g_OrigCreateDevice = reinterpret_cast<PFN_CreateDevice>(vtbl[VT_D3D9_CREATEDEVICE]);
-    vtbl[VT_D3D9_CREATEDEVICE] = reinterpret_cast<void*>(Hooked_CreateDevice);
+    Log("[hook] Installing factory hooks factory=%p vtable=%p isEx=%d perInstance=%d ...",
+        pD3D, vtbl, isEx ? 1 : 0, IsPerInstanceVTable(pD3D, vtbl) ? 1 : 0);
+
+    HookSlot(vtbl, VT_D3D9_CREATEDEVICE, reinterpret_cast<void*>(Hooked_CreateDevice),
+             reinterpret_cast<void**>(&g_OrigCreateDevice));
     if (isEx)
     {
-        g_OrigCreateDeviceEx = reinterpret_cast<PFN_CreateDeviceEx>(vtbl[VT_D3D9_CREATEDEVICEEX]);
-        vtbl[VT_D3D9_CREATEDEVICEEX] = reinterpret_cast<void*>(Hooked_CreateDeviceEx);
+        HookSlot(vtbl, VT_D3D9_CREATEDEVICEEX, reinterpret_cast<void*>(Hooked_CreateDeviceEx),
+                 reinterpret_cast<void**>(&g_OrigCreateDeviceEx));
     }
-    Log("[hook] Factory hooks installed with private vtable=%p (original=%p)", vtbl, original);
+    Log("[hook] Factory hooks installed in place (vtable=%p) CreateDevice orig=%p",
+        vtbl, reinterpret_cast<void*>(g_OrigCreateDevice));
 }
 
 static IDirect3D9* WINAPI Hooked_Direct3DCreate9(UINT sdkVersion)
 {
     PFN_Direct3DCreate9 original = g_OrigDirect3DCreate9;
+    g_FactoryIntercepted.store(true);
     Log("[hook] Direct3DCreate9 intercepted sdk=%u original=%p", sdkVersion, original);
     if (!original) return nullptr;
 
@@ -340,6 +446,7 @@ static IDirect3D9* WINAPI Hooked_Direct3DCreate9(UINT sdkVersion)
 static HRESULT WINAPI Hooked_Direct3DCreate9Ex(UINT sdkVersion, IDirect3D9Ex** ppD3D)
 {
     PFN_Direct3DCreate9Ex original = g_OrigDirect3DCreate9Ex;
+    g_FactoryIntercepted.store(true);
     Log("[hook] Direct3DCreate9Ex intercepted sdk=%u original=%p out=%p", sdkVersion, original, ppD3D);
     if (!original) return E_FAIL;
 
@@ -428,16 +535,6 @@ static void PatchModuleImports(HMODULE module)
     }
 }
 
-// GTA IV resolves Direct3DCreate9 through GetProcAddress, so there is no IAT
-// entry to intercept. For the supported x86 GTAIV.exe build, its master RAGE
-// graphics context lives at VA 0x01295888 when loaded at image base 0x00400000.
-// Context +0 is the wrapper IDirect3D9 interface; the game's d3d9 wrapper
-// redirects its CreateDevice vtable slot to its own implementation. Patching
-// that existing wrapper catches the real device without calling D3D9 ourselves.
-// 0x01295888 is the preferred-image VA reported by analysis. Its RVA is
-// 0x00E95888: retain the subtraction so ASLR is handled.
-static constexpr uintptr_t GTAIV_CONTEXT_RVA = 0x01295888u - 0x00400000u;
-
 static bool ReadTargetPointer(const void* address, void** value)
 {
     SIZE_T read = 0;
@@ -445,95 +542,284 @@ static bool ReadTargetPointer(const void* address, void** value)
            read == sizeof(*value);
 }
 
-static bool IsGTAIVExecutable()
+// ── locating an already-created device (late attach) ─────────────────────────
+//
+// When the DLL is injected into a process that has *already* created its
+// device, there is no CreateDevice call left to intercept, so the device has
+// to be found in memory.
+//
+// Two things make this harder than it looks, both confirmed against a live
+// GTA IV process with the Frida scripts in tools/frida:
+//
+//  * The game may not talk to the system D3D9 runtime at all. A proxy DLL in
+//    the game directory (ReShade, ENB, DXVK) is loaded *as* d3d9.dll and hands
+//    the game its own wrapper objects, whose vtables live in the proxy image.
+//    So "is this vtable in d3d9.dll?" must be asked by export, not by name.
+//
+//  * A vtable cannot be identified by shape. D3D9 vtables sit back-to-back in
+//    .rdata, so "119 consecutive code pointers" matches a texture vtable
+//    followed by its neighbours just as well as a device. QueryInterface is
+//    the only authoritative answer.
+//
+// The sweep is deliberately limited to the writable sections of loaded modules.
+// Sweeping the whole heap turns up freed and recycled allocations that merely
+// look COM-shaped, and calling QueryInterface on one of those crashes the host
+// process — observed doing exactly that during development.
+
+static bool ModuleImplementsD3D9(HMODULE module)
 {
-    char path[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    const char* name = strrchr(path, '\\');
-    return _stricmp(name ? name + 1 : path, "GTAIV.exe") == 0;
+    // A proxy wrapper is usually called d3d9.dll, but so is the real runtime,
+    // and some wrappers use another name entirely. The export is what matters.
+    return module &&
+           (GetProcAddress(module, "Direct3DCreate9") != nullptr ||
+            GetProcAddress(module, "Direct3DCreate9Ex") != nullptr);
 }
 
-static void WaitForGTAIVDevice()
+// Is `address` executable code belonging to `module`?
+static bool IsCodeInModule(const void* address, HMODULE module)
 {
-#if defined(_WIN64)
-    Log("[gtaiv] RAGE context resolver is only valid for the x86 GTA IV executable");
-#else
-    const uintptr_t contextAddress = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr)) + GTAIV_CONTEXT_RVA;
-    Log("[gtaiv] Waiting for RAGE IDirect3D9 context at %p", reinterpret_cast<void*>(contextAddress));
+    if (!address || !module) return false;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.AllocationBase != module) return false;
+    const DWORD exec = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                       PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return (mbi.Protect & exec) != 0;
+}
 
-    void* lastContext = nullptr;
-    for (unsigned elapsed = 0; elapsed < 60000 && !g_DeviceHooked.load(); elapsed += 10)
+// Which loaded D3D9 implementation owns this vtable, if any?  A genuine COM
+// vtable has QueryInterface/AddRef/Release in slots 0-2, and all three must be
+// code in one and the same module.
+static HMODULE OwnerOfD3D9VTable(void* const* vtable)
+{
+    if (!vtable) return nullptr;
+
+    void* slot[3] = {};
+    for (int i = 0; i < 3; ++i)
     {
-        void* context = nullptr;
-        void* factory = nullptr;
-        void* vtable = nullptr;
-        void* createDevice = nullptr;
-        if (ReadTargetPointer(reinterpret_cast<void*>(contextAddress), &context) && context != lastContext)
+        if (!ReadTargetPointer(vtable + i, &slot[i]) || !slot[i]) return nullptr;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(slot[0], &mbi, sizeof(mbi)) == 0) return nullptr;
+    const auto module = static_cast<HMODULE>(mbi.AllocationBase);
+    if (!ModuleImplementsD3D9(module)) return nullptr;
+
+    for (int i = 0; i < 3; ++i)
+    {
+        if (!IsCodeInModule(slot[i], module)) return nullptr;
+    }
+    return module;
+}
+
+// Ask the object what it is. Safe on anything that really is a COM object: a
+// texture simply answers E_NOINTERFACE.
+static bool QueryIsDevice(IUnknown* candidate, bool* isEx)
+{
+    if (isEx) *isEx = false;
+    if (!candidate) return false;
+
+    bool found = false;
+    IDirect3DDevice9Ex* ex = nullptr;
+    if (SUCCEEDED(candidate->QueryInterface(__uuidof(IDirect3DDevice9Ex),
+                                            reinterpret_cast<void**>(&ex))) && ex)
+    {
+        ex->Release();
+        if (isEx) *isEx = true;
+        found = true;
+    }
+
+    IDirect3DDevice9* dev = nullptr;
+    if (SUCCEEDED(candidate->QueryInterface(__uuidof(IDirect3DDevice9),
+                                            reinterpret_cast<void**>(&dev))) && dev)
+    {
+        dev->Release();
+        found = true;
+    }
+    return found;
+}
+
+// Walk one module's writable sections looking for a stored device pointer.
+static IDirect3DDevice9* ScanModuleForDevice(HMODULE module, bool* isEx)
+{
+    if (!module) return nullptr;
+
+    const auto image = reinterpret_cast<const unsigned char*>(module);
+    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+    if (IsBadReadPtr(dos, sizeof(*dos)) || dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(image + dos->e_lfanew);
+    if (IsBadReadPtr(nt, sizeof(*nt)) || nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+    const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    {
+        const IMAGE_SECTION_HEADER& sh = sections[i];
+        if (!(sh.Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+
+        // Use the section's own virtual size. VirtualQuery's region size stops
+        // at the first protection change, which would truncate the sweep to a
+        // single page.
+        const auto begin = reinterpret_cast<void* const*>(image + sh.VirtualAddress);
+        const size_t count = sh.Misc.VirtualSize / sizeof(void*);
+
+        for (size_t j = 0; j < count; ++j)
         {
-            Log("[gtaiv] RAGE context changed: %p at %u ms", context, elapsed);
-            lastContext = context;
+            void* candidate = nullptr;
+            if (!ReadTargetPointer(begin + j, &candidate) || !candidate) continue;
+
+            void* vtable = nullptr;
+            if (!ReadTargetPointer(candidate, &vtable) || !vtable) continue;
+
+            const HMODULE owner = OwnerOfD3D9VTable(static_cast<void* const*>(vtable));
+            if (!owner) continue;
+
+            bool candidateIsEx = false;
+            if (!QueryIsDevice(static_cast<IUnknown*>(candidate), &candidateIsEx)) continue;
+
+            Log("[scan] Confirmed device=%p vtable=%p owner=%p isEx=%d "
+                "(found in module=%p section='%.8s' at +0x%zx)",
+                candidate, vtable, owner, candidateIsEx ? 1 : 0,
+                module, sh.Name, static_cast<size_t>(sh.VirtualAddress + j * sizeof(void*)));
+            if (isEx) *isEx = candidateIsEx;
+            return static_cast<IDirect3DDevice9*>(candidate);
         }
-        // A late attach may miss CreateDevice entirely. The verified RAGE
-        // context also retains a secondary device reference at +0x160; prefer
-        // it when it exposes a valid Present slot so an already-running game
-        // can be captured without recreating anything.
-        void* device = nullptr;
-        void* deviceVTable = nullptr;
-        void* present = nullptr;
-        if (context &&
-            ReadTargetPointer(static_cast<unsigned char*>(context) + 0x160, &device) && device &&
-            ReadTargetPointer(device, &deviceVTable) && deviceVTable &&
-            ReadTargetPointer(static_cast<void**>(deviceVTable) + VT_DEVICE_PRESENT, &present) && present)
+    }
+    return nullptr;
+}
+
+// Sweep the executable and every loaded D3D9 implementation.
+static IDirect3DDevice9* ScanForExistingDevice(bool* isEx)
+{
+    if (IDirect3DDevice9* dev = ScanModuleForDevice(GetModuleHandleA(nullptr), isEx))
+        return dev;
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE)
+    {
+        Log("[scan] CreateToolhelp32Snapshot failed: %lu", GetLastError());
+        return nullptr;
+    }
+
+    IDirect3DDevice9* found = nullptr;
+    MODULEENTRY32 entry = {};
+    entry.dwSize = sizeof(entry);
+    if (Module32First(snapshot, &entry))
+    {
+        do
         {
-            Log("[gtaiv] Found existing device candidate=%p vtable=%p Present=%p after %u ms",
-                device, deviceVTable, present, elapsed);
-            InstallDeviceHooks(static_cast<IDirect3DDevice9*>(device), false);
+            HMODULE module = entry.hModule;
+            if (module == g_ThisModule || !ModuleImplementsD3D9(module)) continue;
+            found = ScanModuleForDevice(module, isEx);
+        } while (!found && Module32Next(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return found;
+}
+
+// Wait for a device, then — only if the passive route cannot work — go looking
+// for one.
+//
+// The distinction matters enormously. Probing memory is read-only and safe, but
+// confirming a candidate means calling QueryInterface on it, and that is a call
+// INTO the D3D9 runtime from this worker thread. Doing that while the game's
+// render thread is inside CreateDevice deadlocks on the runtime's internal
+// locks — the original GTA IV freeze, reintroduced from a new direction.
+// (Observed: the test app never returned from CreateDevice when the scan ran
+// concurrently with it.)
+//
+// So: if our patched import slot has been called, the game has not created its
+// device yet and Hooked_CreateDevice is guaranteed to deliver it. In that case
+// we wait and touch nothing. Scanning is reserved for a late attach, where the
+// factory call happened before we existed and there is nothing left to catch.
+//
+// Even then the scan is best-effort. It cannot find a device the game keeps
+// only on the heap, which is what a RAGE-engine title such as GTA IV does, and
+// widening it to sweep the heap is not an option: freed allocations still look
+// COM-shaped, and calling QueryInterface on one crashes the host process.
+// --launch remains the supported way in.
+static void PollForExistingDevice(unsigned timeoutMs)
+{
+    const unsigned kGracePeriodMs = 5000;
+
+    Log("[poll] Waiting for a device (timeout %u ms)", timeoutMs);
+
+    bool announcedPassive = false;
+    for (unsigned elapsed = 0; elapsed < timeoutMs && !g_DeviceHooked.load(); elapsed += 50)
+    {
+        Sleep(50);
+        if (g_DeviceHooked.load()) break;
+
+        // The game is mid-startup and will call our CreateDevice hook. Stay out
+        // of the runtime's way.
+        if (g_FactoryIntercepted.load())
+        {
+            if (!announcedPassive)
+            {
+                Log("[poll] Our import hook was called; waiting for the game's own "
+                    "CreateDevice instead of probing D3D9");
+                announcedPassive = true;
+            }
+            continue;
+        }
+
+        // Give a normal startup a moment to reach Direct3DCreate9 before
+        // concluding that this is a late attach.
+        if (elapsed < kGracePeriodMs) continue;
+
+        // Never call into D3D9 while the game is inside CreateDevice.
+        if (g_D3D9CallsInFlight.load() > 0) continue;
+
+        bool isEx = false;
+        if (IDirect3DDevice9* scanned = ScanForExistingDevice(&isEx))
+        {
+            Log("[poll] Found an existing device by scan after %u ms (isEx=%d)",
+                elapsed, isEx ? 1 : 0);
+            InstallDeviceHooks(scanned, isEx);
             if (g_DeviceHooked.load()) return;
         }
-
-        if (context &&
-            ReadTargetPointer(context, &factory) && factory &&
-            ReadTargetPointer(factory, &vtable) && vtable &&
-            ReadTargetPointer(static_cast<void**>(vtable) + VT_D3D9_CREATEDEVICE, &createDevice) && createDevice)
-        {
-            Log("[gtaiv] Found RAGE factory=%p vtable=%p CreateDevice=%p after %u ms",
-                factory, vtable, createDevice, elapsed);
-            InstallFactoryHooks(static_cast<IDirect3D9*>(factory), false);
-            Log("[gtaiv] Hooked wrapper CreateDevice; waiting for the game to create its device");
-            return;
-        }
-        Sleep(10);
     }
-    Log("[gtaiv] Timed out waiting for RAGE factory context; no device was hooked");
-#endif
+
+    if (g_DeviceHooked.load())
+        Log("[poll] Device hooks are live.");
+    else
+        Log("[poll] No device found. If the game was already running, inject with "
+            "--launch so the import hook is in place before D3D9 starts.");
 }
 
 static void HookDirect3D9Factory()
 {
-    if (IsGTAIVExecutable())
-    {
-        WaitForGTAIVDevice();
-        return;
-    }
-
-    // Restrict the early-startup hook to the executable's import table.  A
-    // process can contain overlays, compatibility layers, and D3D helper DLLs
-    // which also import Direct3DCreate9 while establishing their own loader
-    // state.  Hooking those secondary imports can re-enter their initialization
-    // path and crash the title before its main thread starts.  GTA IV imports
-    // D3D9 from its executable, which is the stable interception point.
+    // Patch the executable's import table FIRST, unconditionally.
+    //
+    // This used to be skipped entirely for GTAIV.exe, on the assumption that
+    // the game resolves Direct3DCreate9 through GetProcAddress and so has no
+    // import slot to patch. That assumption is wrong: GTAIV.exe carries a
+    // normal Direct3DCreate9 import (verified in a live process — the slot sits
+    // at RVA 0xa73554 in the retail x86 build and resolves to whichever d3d9
+    // implementation is loaded, including a ReShade/ENB proxy). Skipping it
+    // threw away the one reliable hook in favour of a hard-coded address.
+    //
+    // The scan stays restricted to the executable: a process can contain
+    // overlays and helper DLLs that also import Direct3DCreate9 while still
+    // establishing their own loader state, and hooking those can re-enter their
+    // initialization path and crash the title before its main thread starts.
     HMODULE executable = GetModuleHandleA(nullptr);
     char executablePath[MAX_PATH] = {};
     GetModuleFileNameA(executable, executablePath, MAX_PATH);
-    Log("[hook] Scanning executable import table only: %s (%p)", executablePath, executable);
+    Log("[hook] Scanning executable import table: %s (%p)", executablePath, executable);
     PatchModuleImports(executable);
 
     const unsigned long seen = g_FactoryImportsSeen.load();
     const unsigned long patched = g_FactoryImportsPatched.load();
     Log("[hook] Factory import scan complete: d3d9 import descriptors=%lu patched slots=%lu", seen, patched);
     if (!patched)
-        Log("[hook] No Direct3DCreate9 import in the executable. This title may use GetProcAddress, "
-            "a proxy DLL, or a delay-load import; no secondary module is patched during startup.");
+        Log("[hook] No Direct3DCreate9 import was patched. This title may use GetProcAddress, "
+            "a proxy DLL, or a delay-load import.");
+
+    // Either way, keep looking for a device that already exists. With the
+    // import hooked this loop normally exits on the first pass once the game
+    // creates its device; on a late attach it is the only path that can work.
+    PollForExistingDevice(60000);
 }
 
 // ── worker thread ─────────────────────────────────────────────────────────────
