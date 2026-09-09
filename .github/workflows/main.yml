@@ -45,10 +45,12 @@ jobs:
         working-directory: src
         shell: cmd
         run: |
-          cl /nologo /W3 /WX /O2 /MD /LD ^
+          cl /nologo /W3 /WX /O2 /MD /LD /I imgui /I imgui\backends ^
              /Fo:bin\ ^
              /Fe:bin\d3d9capture.dll ^
-             dllmain.cpp capture.cpp consumer_backend.cpp ^
+             dllmain.cpp capture.cpp consumer_backend.cpp overlay.cpp ^
+             imgui\imgui.cpp imgui\imgui_draw.cpp imgui\imgui_widgets.cpp imgui\imgui_tables.cpp imgui\imgui_demo.cpp ^
+             imgui\backends\imgui_impl_win32.cpp imgui\backends\imgui_impl_dx9.cpp ^
              /link d3d9.lib user32.lib gdi32.lib kernel32.lib
 
       # ── 5. Build inject_tool.exe ───────────────────────────────────────────
