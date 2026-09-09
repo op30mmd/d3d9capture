@@ -227,12 +227,25 @@ int main(int argc, char* argv[])
             strncat_s(commandLine, sizeof(commandLine), argv[i], _TRUNCATE);
         }
 
+        // Run the game from its own directory. Games resolve their data files
+        // relative to the working directory, so inheriting the injector's cwd
+        // makes a real title fail to start (GTA IV looks for common\ and pc\
+        // beside the executable).
+        char workingDir[MAX_PATH] = {};
+        strncpy_s(workingDir, sizeof(workingDir), gamePath, _TRUNCATE);
+        if (char* lastSlash = strrchr(workingDir, '\\'))
+            *lastSlash = '\0';
+        else
+            workingDir[0] = '\0';
+
         STARTUPINFOA si = {};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi = {};
         printf("[inject] Launching suspended: %s\n", commandLine);
+        printf("[inject] Working directory: %s\n", workingDir[0] ? workingDir : "<inherited>");
         if (!CreateProcessA(gamePath, commandLine, nullptr, nullptr, FALSE,
-                            CREATE_SUSPENDED, nullptr, nullptr, &si, &pi))
+                            CREATE_SUSPENDED, nullptr,
+                            workingDir[0] ? workingDir : nullptr, &si, &pi))
         {
             printf("[inject] CreateProcess failed: %lu\n", GetLastError());
             return 1;
