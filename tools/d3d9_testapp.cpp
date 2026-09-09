@@ -36,17 +36,15 @@ int main(int argc, char* argv[])
     wc.hInstance = GetModuleHandleA(nullptr);
     wc.lpszClassName = "d3d9capture_testapp";
     RegisterClassA(&wc);
-
     HWND hwnd = CreateWindowA(wc.lpszClassName, "d3d9capture test app",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
         640, 480, nullptr, nullptr, wc.hInstance, nullptr);
     if (!hwnd) { printf("[testapp] CreateWindow failed: %lu\n", GetLastError()); return 1; }
 
-    // Called through the IAT, exactly like a game — this is the slot
-    // d3d9capture patches.
-    IDirect3D9* d3d = Direct3DCreate9(D3D_SDK_VERSION);
-    if (!d3d) { printf("[testapp] Direct3DCreate9 failed\n"); return 1; }
-    printf("[testapp] factory=%p\n", (void*)d3d);
+    IDirect3D9Ex* d3dEx = nullptr;
+    HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &d3dEx);
+    if (FAILED(hr) || !d3dEx) { printf("[testapp] Direct3DCreate9Ex failed: hr=0x%08lX\n", hr); return 1; }
+    printf("[testapp] factoryEx=%p\n", (void*)d3dEx);
 
     D3DPRESENT_PARAMETERS pp = {};
     pp.Windowed = TRUE;
@@ -57,12 +55,12 @@ int main(int argc, char* argv[])
     pp.hDeviceWindow = hwnd;
 
     IDirect3DDevice9* dev = nullptr;
-    HRESULT hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
-        D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
+    hr = d3dEx->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
+        D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &dev);
     if (FAILED(hr) || !dev)
     {
         printf("[testapp] CreateDevice failed hr=0x%08lX\n", hr);
-        d3d->Release();
+        d3dEx->Release();
         return 1;
     }
     printf("[testapp] device=%p\n", (void*)dev);
@@ -76,6 +74,43 @@ int main(int argc, char* argv[])
             if (msg.message == WM_QUIT) { frame = totalFrames; break; }
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
+        }
+
+        if (totalFrames >= 100)
+        {
+            if (frame == 15)
+            {
+                printf("[testapp] Frame 15: Toggling ImGui overlay ON (VK_INSERT)\n");
+                SendMessageA(hwnd, WM_KEYDOWN, VK_INSERT, 0);
+            }
+            else if (frame == 25)
+            {
+                printf("[testapp] Frame 25: Toggling Video Recording ON (VK_F9)\n");
+                SendMessageA(hwnd, WM_KEYDOWN, VK_F9, 0);
+            }
+            else if (frame == 50)
+            {
+                printf("[testapp] Frame 50: Simulating mouse interaction on overlay\n");
+                SendMessageA(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(150, 100));
+                SendMessageA(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(150, 100));
+                SendMessageA(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(150, 100));
+            }
+            else if (frame == 75)
+            {
+                printf("[testapp] Frame 75: Toggling Video Recording OFF (VK_F9)\n");
+                SendMessageA(hwnd, WM_KEYDOWN, VK_F9, 0);
+            }
+            else if (frame == 85)
+            {
+                printf("[testapp] Frame 85: Triggering device Reset()\n");
+                HRESULT rhr = dev->Reset(&pp);
+                printf("[testapp] dev->Reset returned hr=0x%08lX\n", rhr);
+            }
+            else if (frame == 95)
+            {
+                printf("[testapp] Frame 95: Toggling ImGui overlay OFF (VK_INSERT)\n");
+                SendMessageA(hwnd, WM_KEYDOWN, VK_INSERT, 0);
+            }
         }
 
         // A changing colour makes captured frames easy to tell apart.
@@ -95,7 +130,7 @@ int main(int argc, char* argv[])
 
     printf("[testapp] done, %d frames presented\n", totalFrames);
     dev->Release();
-    d3d->Release();
+    d3dEx->Release();
     DestroyWindow(hwnd);
     return 0;
 }

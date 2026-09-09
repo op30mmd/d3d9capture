@@ -46,8 +46,8 @@ void Capture_ReleaseSurfaces();
  * render thread's.
  */
 bool Capture_WantsFrame();
+bool Capture_IsConsumerActive();
 
-// ── frame descriptor handed to the consumer backend ──────────────────────────
 struct FrameData
 {
     const void* pixels;   // top-left origin, tightly-packed rows
@@ -57,6 +57,36 @@ struct FrameData
     D3DFORMAT   format;   // typically D3DFMT_A8R8G8B8 or D3DFMT_X8R8G8B8
     UINT64      frameIdx; // monotonically increasing counter
 };
+
+struct CaptureStats
+{
+    UINT64    presentCalls;
+    UINT64    capturedFrames;
+    UINT      width;
+    UINT      height;
+    D3DFORMAT format;
+    float     presentFps;
+    float     captureFps;
+    float     readbackMs;
+    bool      isConsumerActive;
+    bool      captureEnabled;
+    int       targetFps;
+    int       dumpQuotaRemaining;
+    char      lastScreenshotPath[MAX_PATH];
+};
+
+void Capture_GetStats(CaptureStats* pStats);
+void Capture_SetEnabled(bool enabled);
+bool Capture_IsEnabled();
+void Capture_SetTargetFps(int targetFps);
+int  Capture_GetTargetFps();
+void Capture_TriggerSnapshot();
+bool Capture_IsSnapshotPending();
+bool Capture_TakeSnapshotPending();
+void Capture_SetLastScreenshotPath(const char* path);
+void Capture_GetLastScreenshotPath(char* dst, size_t maxLen);
+void Capture_SetDumpQuota(int count);
+int  Capture_GetDumpQuota();
 
 /**
  * Consumer callback — implement or replace this in consumer_backend.cpp.

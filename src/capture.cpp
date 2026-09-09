@@ -60,6 +60,59 @@ static std::atomic<UINT64>     g_FrameIdx{ 0 };
 static std::atomic<UINT64>     g_PresentCalls{ 0 };
 static std::atomic<bool>       g_Shutdown{ false };
 
+static std::atomic<bool>       g_CaptureEnabled{ true };
+static std::atomic<int>        g_TargetFps{ 0 }; // 0 = unlimited
+static std::atomic<UINT>       g_LastWidth{ 0 };
+static std::atomic<UINT>       g_LastHeight{ 0 };
+static std::atomic<D3DFORMAT>  g_LastFormat{ D3DFMT_UNKNOWN };
+static std::atomic<float>      g_LastReadbackMs{ 0.0f };
+static std::atomic<float>      g_PresentFps{ 0.0f };
+static std::atomic<float>      g_CaptureFps{ 0.0f };
+
+static LARGE_INTEGER           g_QpcFreq = {};
+static LARGE_INTEGER           g_LastFpsCalc = {};
+static UINT64                  g_LastFpsPresentCount = 0;
+static UINT64                  g_LastFpsCaptureCount = 0;
+static LARGE_INTEGER           g_LastCaptureTime = {};
+
+void Capture_SetEnabled(bool enabled)
+{
+    g_CaptureEnabled.store(enabled);
+}
+
+bool Capture_IsEnabled()
+{
+    return g_CaptureEnabled.load();
+}
+
+void Capture_SetTargetFps(int targetFps)
+{
+    g_TargetFps.store(targetFps);
+}
+
+int Capture_GetTargetFps()
+{
+    return g_TargetFps.load();
+}
+
+void Capture_GetStats(CaptureStats* pStats)
+{
+    if (!pStats) return;
+    pStats->presentCalls        = g_PresentCalls.load();
+    pStats->capturedFrames      = g_FrameIdx.load();
+    pStats->width               = g_LastWidth.load();
+    pStats->height              = g_LastHeight.load();
+    pStats->format              = g_LastFormat.load();
+    pStats->presentFps          = g_PresentFps.load();
+    pStats->captureFps          = g_CaptureFps.load();
+    pStats->readbackMs          = g_LastReadbackMs.load();
+    pStats->isConsumerActive    = Capture_IsConsumerActive();
+    pStats->captureEnabled      = g_CaptureEnabled.load();
+    pStats->targetFps           = g_TargetFps.load();
+    pStats->dumpQuotaRemaining  = Capture_GetDumpQuota();
+    Capture_GetLastScreenshotPath(pStats->lastScreenshotPath, sizeof(pStats->lastScreenshotPath));
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 static void ReleaseSurface(StagingSurface& s)
 {
@@ -168,9 +221,51 @@ void Capture_OnPresent(IDirect3DDevice9* pDev)
     static bool logged = false;
     if (!logged) { Log("[cap] Capture_OnPresent called (first time), device=%p", pDev); logged = true; }
 
-    // Nothing downstream wants this frame: skip the readback entirely. It is
-    // a synchronous GPU sync point costing several milliseconds per frame, and
-    // paying it to produce a frame that is then discarded is pure loss.
+    // Initialize frequency if first time
+    if (g_QpcFreq.QuadPart == 0)
+    {
+        QueryPerformanceFrequency(&g_QpcFreq);
+        QueryPerformanceCounter(&g_LastFpsCalc);
+        g_LastCaptureTime = g_LastFpsCalc;
+    }
+
+    // ── Update rolling FPS counters (every 500 ms) ───────────────────────────
+    LARGE_INTEGER nowQpc = {};
+    QueryPerformanceCounter(&nowQpc);
+    double elapsedSec = static_cast<double>(nowQpc.QuadPart - g_LastFpsCalc.QuadPart) / static_cast<double>(g_QpcFreq.QuadPart);
+    if (elapsedSec >= 0.5)
+    {
+        UINT64 curPresents = presentNumber;
+        UINT64 curCaptures = g_FrameIdx.load();
+        g_PresentFps.store(static_cast<float>((curPresents - g_LastFpsPresentCount) / elapsedSec));
+        g_CaptureFps.store(static_cast<float>((curCaptures - g_LastFpsCaptureCount) / elapsedSec));
+        g_LastFpsPresentCount = curPresents;
+        g_LastFpsCaptureCount = curCaptures;
+        g_LastFpsCalc = nowQpc;
+    }
+
+    // ── Master enable & Snapshot bypass ──────────────────────────────────────
+    bool snapshotPending = Capture_IsSnapshotPending();
+    bool dumpPending = (Capture_GetDumpQuota() > 0);
+
+    if (!g_CaptureEnabled.load() && !snapshotPending && !dumpPending)
+    {
+        return; // Capture temporarily disabled by user in overlay
+    }
+
+    // ── Target FPS Throttling ────────────────────────────────────────────────
+    int targetFps = g_TargetFps.load();
+    if (targetFps > 0 && !snapshotPending && !dumpPending)
+    {
+        double minIntervalSec = 1.0 / static_cast<double>(targetFps);
+        double timeSinceLastCap = static_cast<double>(nowQpc.QuadPart - g_LastCaptureTime.QuadPart) / static_cast<double>(g_QpcFreq.QuadPart);
+        if (timeSinceLastCap < minIntervalSec)
+        {
+            return; // Throttle: skip this frame to conserve GPU bandwidth
+        }
+    }
+
+    // ── Consumer readiness check ─────────────────────────────────────────────
     if (!Capture_WantsFrame())
     {
         if ((presentNumber % 1800) == 0)
@@ -222,14 +317,11 @@ void Capture_OnPresent(IDirect3DDevice9* pDev)
 
     StagingSurface& ws = g_Staging[g_WriteIdx];
 
-    // ── C: GPU → system-memory DMA ────────────────────────────────────────
-    // GetRenderTargetData stalls until the GPU has finished rendering to the
-    // surface (implicit fence), then initiates the DMA.  This is the only
-    // unavoidable GPU sync point; there is no async alternative in raw D3D9
-    // without extensions.  D3D9Ex (Vista+) offers GetRenderTargetData on a
-    // query to overlap it with the CPU, but for maximum compatibility we keep
-    // the synchronous path here.
+    // ── C: GPU → system-memory DMA with latency measurement ───────────────
+    LARGE_INTEGER rbStart = {}, rbEnd = {};
+    QueryPerformanceCounter(&rbStart);
     HRESULT hr = pDev->GetRenderTargetData(pBB, ws.pSurf);
+    QueryPerformanceCounter(&rbEnd);
     pBB->Release();
 
     if (FAILED(hr))
@@ -239,6 +331,13 @@ void Capture_OnPresent(IDirect3DDevice9* pDev)
         return;
     }
     ws.pending = true;
+
+    double rbMs = static_cast<double>(rbEnd.QuadPart - rbStart.QuadPart) * 1000.0 / static_cast<double>(g_QpcFreq.QuadPart);
+    g_LastReadbackMs.store(static_cast<float>(rbMs));
+    g_LastWidth.store(desc.Width);
+    g_LastHeight.store(desc.Height);
+    g_LastFormat.store(desc.Format);
+    g_LastCaptureTime = rbEnd;
 
     // ── D: swap slots ─────────────────────────────────────────────────────
     int prevRead  = g_ReadIdx;
@@ -272,10 +371,10 @@ void Capture_OnPresent(IDirect3DDevice9* pDev)
     Capture_FrameReady(fd);   // consumer must return before we unlock!
 
     if ((presentNumber % 300) == 0)
-        Log("[cap] heartbeat: presents=%llu captured=%llu %ux%u stride=%u fmt=%u",
+        Log("[cap] heartbeat: presents=%llu captured=%llu %ux%u stride=%u fmt=%u rb=%.2fms",
             static_cast<unsigned long long>(presentNumber),
             static_cast<unsigned long long>(fd.frameIdx + 1), fd.width, fd.height,
-            fd.stride, static_cast<unsigned>(fd.format));
+            fd.stride, static_cast<unsigned>(fd.format), static_cast<double>(g_LastReadbackMs.load()));
 
     rs.pSurf->UnlockRect();
 }

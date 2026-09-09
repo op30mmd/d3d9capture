@@ -216,12 +216,16 @@ int main(int argc, char* argv[])
             return 1;
         }
 
-        // CreateProcess may modify the command-line buffer.  Keep the game
-        // path quoted and pass optional arguments exactly as supplied.
+        bool waitExit = false;
         char commandLine[8192] = {};
         _snprintf_s(commandLine, sizeof(commandLine), _TRUNCATE, "\"%s\"", gamePath);
         for (int i = 4; i < argc; ++i)
         {
+            if (strcmp(argv[i], "--wait") == 0)
+            {
+                waitExit = true;
+                continue;
+            }
             if (strcmp(argv[i], "--") == 0 && i == 4) continue;
             strncat_s(commandLine, sizeof(commandLine), " ", _TRUNCATE);
             strncat_s(commandLine, sizeof(commandLine), argv[i], _TRUNCATE);
@@ -243,7 +247,7 @@ int main(int argc, char* argv[])
         PROCESS_INFORMATION pi = {};
         printf("[inject] Launching suspended: %s\n", commandLine);
         printf("[inject] Working directory: %s\n", workingDir[0] ? workingDir : "<inherited>");
-        if (!CreateProcessA(gamePath, commandLine, nullptr, nullptr, FALSE,
+        if (!CreateProcessA(gamePath, commandLine, nullptr, nullptr, TRUE,
                             CREATE_SUSPENDED, nullptr,
                             workingDir[0] ? workingDir : nullptr, &si, &pi))
         {
@@ -293,6 +297,13 @@ int main(int argc, char* argv[])
         }
         printf("[inject] SUCCESS: resumed PID %lu after injection.\n", pi.dwProcessId);
         CloseHandle(pi.hThread);
+        if (waitExit)
+        {
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            DWORD code = 0;
+            GetExitCodeProcess(pi.hProcess, &code);
+            printf("[inject] Target process exited with code %lu\n", code);
+        }
         CloseHandle(pi.hProcess);
         return 0;
     }
