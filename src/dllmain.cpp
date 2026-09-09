@@ -38,6 +38,7 @@
 #include <tlhelp32.h>
 
 #include "capture.h"
+#include "overlay.h"
 
 #include <cstdio>
 #include <cstdarg>
@@ -172,6 +173,7 @@ static HRESULT WINAPI Hooked_Present(
     static bool logged = false;
     if (!logged) { Log("[dll] Hooked_Present called (first time)"); logged = true; }
     Capture_OnPresent(pDev);
+    Overlay_OnPresent(pDev);
     return g_OrigPresent(pDev, pSrc, pDst, hWnd, pDirty);
 }
 
@@ -186,7 +188,10 @@ static HRESULT WINAPI Hooked_SwapChainPresent(
 {
     static bool logged = false;
     if (!logged) { Log("[dll] Hooked_SwapChainPresent called (first time)"); logged = true; }
-    if (g_CaptureDevice) Capture_OnPresent(g_CaptureDevice);
+    if (g_CaptureDevice) {
+        Capture_OnPresent(g_CaptureDevice);
+        Overlay_OnPresent(g_CaptureDevice);
+    }
     return g_OrigSwapChainPresent(pChain, pSrc, pDst, hWnd, pDirty, Flags);
 }
 
@@ -195,10 +200,12 @@ static HRESULT WINAPI Hooked_Reset(
 {
     Log("[dll] Hooked_Reset called");
     Capture_OnPreReset();
+    Overlay_OnPreReset();
     HRESULT hr = g_OrigReset(pDev, pPP);
     if (SUCCEEDED(hr))
     {
         Capture_OnPostReset(pDev);
+        Overlay_OnPostReset(pDev);
         HookSwapChainPresent(pDev);
     }
     return hr;
@@ -211,6 +218,7 @@ static HRESULT WINAPI Hooked_PresentEx(
     static bool logged = false;
     if (!logged) { Log("[dll] Hooked_PresentEx called (first time)"); logged = true; }
     Capture_OnPresent(pDev);
+    Overlay_OnPresent(pDev);
     return g_OrigPresentEx(pDev, pSrc, pDst, hWnd, pDirty, Flags);
 }
 
@@ -219,10 +227,12 @@ static HRESULT WINAPI Hooked_ResetEx(
 {
     Log("[dll] Hooked_ResetEx called");
     Capture_OnPreReset();
+    Overlay_OnPreReset();
     HRESULT hr = g_OrigResetEx(pDev, pPP, pMode);
     if (SUCCEEDED(hr))
     {
         Capture_OnPostReset(pDev);
+        Overlay_OnPostReset(pDev);
         HookSwapChainPresent(pDev);
     }
     return hr;
@@ -329,6 +339,7 @@ static void InstallDeviceHooks(IDirect3DDevice9* pDev, bool bIsEx)
 
     g_CaptureDevice = pDev;
     HookSwapChainPresent(pDev);
+    Overlay_Init(pDev);
     g_DeviceHooked.store(true);
 }
 
@@ -856,7 +867,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
 }
 
 // ── DllMain ───────────────────────────────────────────────────────────────────
-BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID lpReserved)
 {
     switch (reason)
     {
@@ -872,6 +883,11 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
     case DLL_PROCESS_DETACH:
         // Process teardown may hold the loader lock. Avoid releasing D3D/IPC
         // resources here; Windows reclaims process resources on termination.
+        // lpReserved is non-null if the process is terminating, null if dynamic unload.
+        if (lpReserved == nullptr)
+        {
+            Overlay_Shutdown();
+        }
         break;
     }
     return TRUE;
