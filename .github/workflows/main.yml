@@ -25,6 +25,8 @@ jobs:
       # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: true
 
       # ── 2. Set up MSVC environment ─────────────────────────────────────────
       # ilammy/msvc-dev-cmd runs vcvarsall.bat and exports all the compiler
