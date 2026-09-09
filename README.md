@@ -9,41 +9,54 @@ directly from the GPU's back-buffer immediately after the game draws them.
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  Game Process                   │
-│                                                 │
-│  D3D9 Device                                    │
-│  ┌──────────┐   Present()                       │
-│  │ VTable   │──────────────────────────┐        │
-│  └──────────┘                          │        │
-│                                        ▼        │
-│                              ┌─────────────────┐│
-│                              │ Hooked_Present  ││
-│                              │                 ││
-│                              │ GetBackBuffer   ││  GPU → SYSTEMMEM DMA
-│                              │     ↓           ││─────────────────────►
-│                              │ GetRenderTarget ││  (double-buffered)
-│                              │     Data        ││
-│                              │     ↓           ││
-│                              │ LockRect        ││
-│                              │     ↓           ││
-│                              │ FrameReady()    ││
-│                              └────────┬────────┘│
-│                                       │         │
-│         Shared Memory (mmap)          │         │
-│  ┌────────────────────────────┐       │         │
-│  │  ShmHeader + pixel data    │◄──────┘         │
-│  └─────────────┬──────────────┘                 │
-└────────────────│────────────────────────────────┘
-                 │  SetEvent(EvtReady)
-                 ▼
-┌────────────────────────────┐
-│      shm_reader.exe        │
-│  (encoder / streamer / UI) │
-│  WaitForSingleObject       │
-│  → process frame           │
-│  → SetEvent(EvtDone)       │
-└────────────────────────────┘
++-----------------------------------------------------------+
+|                  Game Process                             |
+|                                                           |
+|   D3D9 Device          Swap Chain                         |
+|   +-----------+        +-----------+                      |
+|   | vtable    |        | vtable    |                      |
+|   | slot 17   |        | slot 3    |                      |
+|   +-----+-----+        +-----+-----+                      |
+|         | Present()          | Present()                  |
+|         +---------+----------+                            |
+|                   v                                       |
+|        +----------------------+                           |
+|        | Hooked_Present  /    |                           |
+|        | Hooked_SwapChain     |                           |
+|        |        Present       |                           |
+|        |                      |                           |
+|        | Capture_WantsFrame() |   GPU -> SYSTEMMEM DMA    |
+|        |   ...if nobody is    | ------------------------> |
+|        |   consuming, stop    |   (double-buffered)       |
+|        |          |           |                           |
+|        | GetRenderTargetData  |                           |
+|        | LockRect             |                           |
+|        | FrameReady()         |                           |
+|        +----------+-----------+                           |
+|                   |                                       |
+|   Shared Memory   |                                       |
+|   +---------------v------------+                          |
+|   |  ShmHeader + pixel data    |                          |
+|   |  (+ QPC capture timestamp) |                          |
+|   +---------------+------------+                          |
++-----------------------------------------------------------+
+                  |  SetEvent(EvtReady)
+                  v
++------------------------------+
+|       shm_reader.exe         |
+|                              |
+|   --record -> H.264 MP4 via  |
+|      Media Foundation        |
+|   (or your own encoder)      |
+|                              |
+|   WaitForSingleObject(Ready) |
+|   -> encode / save frame     |
+|   -> pace to --fps           |
+|   -> SetEvent(Done)          |
++------------------------------+
+
+The reader's SetEvent(Done) is what asks for the next frame, so the
+consumer -- not the render thread -- sets the capture rate.
 ```
 
 ---
@@ -52,7 +65,7 @@ directly from the GPU's back-buffer immediately after the game draws them.
 
 | File | Purpose |
 |---|---|
-| `dllmain.cpp` | DLL entry point; hooks D3D9 factory imports and patches Present + Reset |
+| `dllmain.cpp` | DLL entry point; patches the D3D9 factory import, then `CreateDevice`, device `Present`/`Reset`, and swap chain `Present` |
 | `capture.h/cpp` | Double-buffered GPU readback via `GetRenderTargetData` |
 | `consumer_backend.cpp` | Writes frames to named shared memory; optional BMP debug dumps |
 | `inject_tool.cpp` | `CreateRemoteThread` injector; accepts PID or process name |
@@ -80,6 +93,15 @@ build.bat
 ```
 
 Outputs land in `d3d9capture\bin\`.
+
+The verification tools under `tools\` are built separately, since they are not
+part of the shipped product:
+
+```bat
+cl /nologo /W3 /O2 /MD /Fe:..\bin\d3d9_testapp.exe ..\tools\d3d9_testapp.cpp ^
+   /link d3d9.lib user32.lib
+cl /nologo /W3 /O2 /MT /Fe:..\bin\mp4_frame.exe ..\tools\mp4_frame.cpp
+```
 
 ---
 
@@ -131,6 +153,21 @@ because `frameIdx` counts captured frames rather than presented ones, so
 consecutive frames can be arbitrarily far apart in real time; encoding them at a
 fixed cadence would play back at the wrong speed.
 
+### Where output goes
+
+The three outputs land in three different places, which is easy to trip over:
+
+| Output | Location |
+|---|---|
+| Video (`--record <path>`) | Exactly the path given, relative to `shm_reader`'s working directory |
+| Reader BMPs (`--save N [dir]`) | `.\` by default, or the optional directory argument |
+| DLL debug BMPs and `debug.log` | Hardcoded `C:\d3d9capture\` |
+
+So the video does **not** go to `C:\d3d9capture\` — that folder holds only the
+DLL's own first-`DUMP_FRAMES` debug dump and the log. Pass an absolute path to
+put a recording somewhere specific, and keep the `.mp4` extension: the container
+is chosen from it.
+
 To check a recording is actually correct — a vertical flip or a red/blue swap
 still produces a file that plays fine — decode a frame back out:
 
@@ -164,17 +201,30 @@ The DLL replaces the game executable's imports of `Direct3DCreate9` and
 startup patch to the executable avoids re-entering overlay or compatibility
 DLL initialization. The forwarding hook calls the game's original import, then
 patches only the returned factory object's `CreateDevice`/`CreateDeviceEx`
-slots. When the game
-creates its device, those hooks patch `Present` and `Reset` on that device.
+slots. When the game creates its device, those hooks patch `Present` and
+`Reset` on that device, plus `Present` on its implicit swap chain.
 
-This never creates or releases a D3D factory/device from the injection worker.
-That avoids the D3D9 initialization-lock deadlock seen in GTA IV, and is more
-compatible with D3D9 proxy/wrapper DLLs that do not share vtables between
-objects. For the supported x86 `GTAIV.exe`, which resolves `Direct3DCreate9`
-via `GetProcAddress` rather than an import, the DLL instead waits for the RAGE
-master graphics context and hooks its wrapper `IDirect3D9::CreateDevice` slot
-at context offset `+0x000`. Each modified slot is made writable with `VirtualProtect`, exchanged
-atomically, and its original function is retained as the forwarding target.
+This never creates or releases a D3D factory/device from the injection worker,
+which is what avoids the D3D9 initialization-lock deadlock seen in GTA IV. The
+same reasoning applies to searching memory for an existing device: confirming a
+candidate means calling `QueryInterface` on it, and doing that while the render
+thread is inside `CreateDevice` deadlocks on the runtime's internal locks. So
+once the import hook has been called, the DLL waits rather than probing.
+
+`GTAIV.exe` does carry an ordinary `Direct3DCreate9` import — the slot sits at
+RVA `0xa73554` in the retail x86 build. (Earlier revisions of this project
+claimed the game resolved it through `GetProcAddress` and skipped the import
+patch in favour of a hard-coded RAGE context address; that was wrong, and the
+address does not hold a D3D9 factory on a ReShade-proxied install.)
+
+Each modified slot is made writable with `VirtualProtect`, exchanged atomically,
+and its original function retained as the forwarding target. Slots are patched
+**in place** rather than by giving an object a private copy of its vtable.
+Copying breaks two ways: a device's vtable is per-instance (the runtime embeds
+it in the device's own allocation, so relocating it crashes the process), and a
+shared factory vtable is where co-resident overlays already live — ReShade
+recovers its own trampoline from the object's vtable pointer, so pointing the
+factory at a copy makes that lookup fail.
 
 ### 2. Present Hooks (device slot 17 and swap chain slot 3)
 Both are hooked, and hooking both is necessary rather than belt-and-braces:
@@ -227,9 +277,15 @@ the next `Present` to match any new resolution.
 
 ## Extending the Capture
 
+Recording to H.264/MP4 is built in — see [Recording video](#recording-video).
+The sections below are for going beyond it.
+
 ### NVENC / QuickSync Encoding
-Replace the `memcpy` in `consumer_backend.cpp` with a direct map into an
-NV12/BGRA encoder input buffer:
+Media Foundation already uses a hardware encoder where one is available, so
+reach for a vendor SDK only if you need something it will not give you (finer
+rate control, or encoding without the readback). To feed NVENC directly,
+replace the `memcpy` in `consumer_backend.cpp` with a map into an NV12/BGRA
+encoder input buffer:
 ```cpp
 // NVENC example sketch
 NV_ENC_LOCK_INPUT_BUFFER lockParams = {};
@@ -259,8 +315,20 @@ readback cost.
   legitimate purposes (recording, streaming, accessibility tools).
 - **D3D9Ex**: games that use `Direct3DCreate9Ex` have identical vtable layouts;
   the hooks work unchanged.
-- **GPU sync point**: `GetRenderTargetData` introduces a GPU pipeline flush
-  (~0.1–0.5 ms on modern hardware). For maximum frame-rate transparency
-  consider D3D9Ex's `IDirect3DQuery9` approach to overlap the copy.
+- **GPU sync point**: `GetRenderTargetData` forces a GPU pipeline flush, and it
+  is not cheap. Measured in GTA IV at 1280x720 by timing the hook against the
+  `Present` it wraps: **6.8 ms per frame**, against 0.7 ms for the game's own
+  `Present`. (An earlier version of this file estimated 0.1–0.5 ms; that was an
+  order of magnitude optimistic.) This is why capture is gated on consumer
+  demand — idle overhead is 0.03 ms per frame — and why a consumer that does not
+  need every frame should pace itself. To overlap the copy instead of skipping
+  it, consider D3D9Ex's `IDirect3DQuery9` approach.
+- **Late attach does not work on every title**: injecting into an
+  already-running game only succeeds if a device pointer is reachable from a
+  module's writable data. A RAGE-engine title such as GTA IV keeps its device on
+  the heap, where it cannot be found safely — sweeping the heap turns up freed
+  allocations that still look COM-shaped, and calling `QueryInterface` on one
+  crashes the host. Use `--launch` so the import hook is in place before D3D9
+  starts.
 - **Format**: Most games use `D3DFMT_X8R8G8B8` (BGRA byte order). Check
   `FrameData::format` and convert if your downstream expects RGBA.
