@@ -22,6 +22,20 @@ enum class OverlayRenderer
 };
 
 static std::atomic<bool> g_OverlayInitialized{ false };
+
+// Overlay_Init and Overlay_InitDXGI can both be entered from two threads at
+// once: the DLL's worker thread installs hooks the moment it finds a device or
+// swap chain (including via the memory scan), while the game's render thread
+// reaches the same init from inside Present. Testing g_OverlayInitialized alone
+// leaves a window several milliseconds wide -- all of CreateContext, both
+// backend inits and the WndProc hook -- in which both threads pass the check.
+//
+// Running the WndProc hook twice is the dangerous part: the second
+// SetWindowLongPtr returns the HookedWndProc we already installed and stores it
+// as g_OriginalWndProc, so CallWindowProc recurses into itself and blows the
+// stack on the next window message. That reads as a random startup crash with
+// nothing pointing at the overlay.
+static std::mutex g_OverlayInitMtx;
 static std::atomic<OverlayRenderer> g_ActiveRenderer{ OverlayRenderer::None };
 
 static HWND g_OverlayHwnd = nullptr;
@@ -872,6 +886,13 @@ void Overlay_Init(IDirect3DDevice9* pDev)
     Log("[overlay] Overlay_Init entry pDev=%p", pDev);
     if (g_OverlayInitialized.load()) return;
 
+    std::lock_guard<std::mutex> initLock(g_OverlayInitMtx);
+    if (g_OverlayInitialized.load())
+    {
+        Log("[overlay] Another thread completed init first; nothing to do");
+        return;
+    }
+
     D3DDEVICE_CREATION_PARAMETERS cp = {};
     HRESULT hrcp = pDev->GetCreationParameters(&cp);
     Log("[overlay] GetCreationParameters hr=0x%08lX hwnd=%p", hrcp, cp.hFocusWindow);
@@ -958,6 +979,13 @@ void Overlay_InitDXGI(IDXGISwapChain* pSwapChain)
 {
     Log("[overlay] Overlay_InitDXGI entry pSwapChain=%p", pSwapChain);
     if (g_OverlayInitialized.load()) return;
+
+    std::lock_guard<std::mutex> initLock(g_OverlayInitMtx);
+    if (g_OverlayInitialized.load())
+    {
+        Log("[overlay] Another thread completed init first; nothing to do");
+        return;
+    }
 
     DXGI_SWAP_CHAIN_DESC desc = {};
     if (FAILED(pSwapChain->GetDesc(&desc)) || !desc.OutputWindow)

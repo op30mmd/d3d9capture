@@ -87,8 +87,8 @@ consumer -- not the render thread -- sets the capture rate.
 | `imgui/` | Dear ImGui, as a git submodule |
 | `build.bat` | MSVC build script for 32-bit and 64-bit targets |
 | `tools/d3d9_testapp.cpp` | Minimal D3D9 app used as a verification target |
-| `tools/d3d11_testapp.cpp` | Minimal D3D11/DXGI verification target; can emulate MSAA and `DXGI_PRESENT_TEST` occlusion polling |
-| `tools/mp4_frame.cpp` | Decodes frames from a recorded MP4 back to BMP, to verify output |
+| `tools/d3d11_testapp.cpp` | Minimal D3D11/DXGI verification target; can emulate MSAA, `DXGI_PRESENT_TEST` occlusion polling, and non-16-aligned widths that produce a padded GPU pitch |
+| `tools/mp4_frame.cpp` | Decodes frames from a recorded MP4 back to BMP, to verify output; reads the decoder's real row pitch rather than assuming packed rows |
 | `tools/frida/` | Scripts that verify the hooks inside a live process |
 
 ---
@@ -225,6 +225,23 @@ and capturing them handed the consumer a back buffer that was never presented
 ### 2. D3D11 Staging Readback
 Inside `IDXGISwapChain::Present`, the backbuffer texture is retrieved. If multisampled, it is resolved via `ResolveSubresource`. Double-buffered staging textures (`D3D11_USAGE_STAGING`, `D3D11_CPU_ACCESS_READ`) perform GPU->CPU DMA readbacks via `CopyResource` and map memory for zero-copy delivery.
 
+### 2b. Why the readback does not stall the render thread
+`CopyResource` only *queues* the GPU->CPU copy. Mapping the texture it was just
+issued into makes the CPU wait for the GPU to finish it, which is a full
+pipeline sync on the render thread for every captured frame -- measured at
+2.1 ms per frame, and felt as a stutter in step with the capture rate.
+
+So the readback always maps the staging texture filled on the **previous**
+captured frame, giving the copy a whole frame to retire, and maps with
+`D3D11_MAP_FLAG_DO_NOT_WAIT` so that under heavy GPU load a frame is skipped
+rather than the render thread stalled. This is what the second staging texture
+is for; the buffers alone do nothing if the wrong one is mapped.
+
+The heartbeat reports `copy=`, `map=` and `hook=` separately for this reason.
+`copy` is near zero by design -- it is just the enqueue. `map` is the GPU wait
+and `hook` is the total time taken from the render thread; those are the numbers
+to watch. `skips=` counts frames dropped instead of stalling.
+
 ### 3. Recorder Threading Model
 One worker thread lives for as long as the recorder is initialised. `Recorder_Start`
 and `Recorder_Stop` never create or join threads — they push `BeginSession` /
@@ -244,6 +261,24 @@ All sink-writer state lives in a worker-local `EncodeSession`, so nothing the
 encoder touches is a shared global. When the queue is full the **oldest frame**
 is dropped; session markers are never dropped, since losing an `EndSession`
 would leave a recording unfinalised.
+
+---
+
+### 4. Overlay init is reachable from two threads
+`Overlay_Init` / `Overlay_InitDXGI` can be entered concurrently: the DLL's worker
+thread calls them as soon as it installs hooks (including from the fallback
+scan), and the game's render thread reaches the same init from inside `Present`.
+Checking the "initialised" flag alone is not enough, because it is only set at
+the *end* of init -- the window covers `CreateContext`, both ImGui backend inits
+and the `WndProc` hook.
+
+Running the `WndProc` hook twice is what kills the process: the second
+`SetWindowLongPtr` returns the `HookedWndProc` already installed and stores it as
+the "original", so `CallWindowProc` recurses into itself until the stack goes.
+Init is therefore serialised with a mutex and re-checks the flag under it.
+`Overlay_Shutdown` deliberately does **not** take that mutex -- it runs from
+`DllMain` under the loader lock, and init can load DLLs, so locking there would
+risk a deadlock instead.
 
 ---
 
@@ -269,6 +304,13 @@ inject_tool.exe --launch d3d11_testapp.exe d3d9capture.dll --wait 300 4
 ::    The DLL log must report presents=900, not 45,900.
 inject_tool.exe --launch d3d11_testapp.exe d3d9capture.dll --wait 900 1 50
 
+:: 3b. PADDED STRIDE. Always test a width that is not a multiple of 16, or a
+::     whole class of bug stays invisible: at 640 and 800 the GPU pitch happens
+::     to equal width*4, so nothing exercises the de-striding path. 1366 gives
+::     a 5504-byte pitch against a 5464-byte row, which is what crashed the
+::     recorder on GTA V. Run it WITH recording enabled.
+inject_tool.exe --launch d3d11_testapp.exe d3d9capture.dll --wait 400 1 0 1366 768
+
 :: 4. Recorder stop-then-restart: frame 76 stops and restarts in one frame.
 ::    The log must show one worker thread, no "WriteSample failed", a per-
 ::    session frame count, and the process must exit with code 0.
@@ -276,6 +318,15 @@ inject_tool.exe --launch d3d11_testapp.exe d3d9capture.dll --wait 200 1 0
 
 :: 5. Recorded output really decodes, right way up:
 mp4_frame.exe C:\d3d9capture\recordings\<file>.mp4 frame_ 3 5
+
+:: 6. The FALLBACK SCAN path, which is the only thing that hooks GTA V.
+::    --launch never reaches it: the import hook succeeds first, and the
+::    poll then waits for the game's own creation instead of probing memory.
+::    Start the app first and attach late, so the worker thread hooks from
+::    the scan while the render thread is already presenting -- which is
+::    also the arrangement that exposes the overlay double-init race.
+d3d11_testapp.exe 600 1 0 1366 768
+inject_tool.exe --wait-for d3d11_testapp.exe d3d9capture.dll --timeout 30
 ```
 
 The D3D9 equivalent (`tools/d3d9_testapp.cpp`, built x86) covers the same ground
@@ -292,6 +343,16 @@ for the D3D9 path including a device `Reset()`.
   re-executes (GTA V). Use `--wait-for`; see *Launcher-stub games* above.
 - **Elevation**: if the game runs elevated, run both `inject_tool.exe` and
   `shm_reader.exe` elevated too, or the reader cannot signal the frame events.
+- **Row pitch**: the GPU pitch of a mapped back buffer is not `width * 4`. It
+  is padded for alignment whenever the width is not a multiple of 16 (GTA V at
+  1366 wide maps at 5504 bytes per row, not 5464). Frames are de-strided into a
+  packed buffer before they are queued, so anything downstream must use
+  `width * 4` and not the pitch the GPU reported. An H.264 *decoder* aligns the
+  same way on the way back out, which is why `tools/mp4_frame.cpp` reads its
+  output pitch instead of assuming one.
+- **Resolution changes while recording**: a sink writer is fixed at the size it
+  was opened with, so frames of a different size are dropped (and logged) rather
+  than encoded. Stop and start the recording to capture at the new size.
 - **Minimised / occluded windows**: capture is skipped for `DXGI_PRESENT_TEST`
   calls, but the DLL has no occlusion check of its own, so a minimised game that
   still issues real `Present` calls is captured (and read back) as usual.
@@ -306,9 +367,13 @@ object*, and the resulting `QueryInterface` / `Release` can corrupt the target's
 heap: injecting into a process where the scan does not quickly find a real swap
 chain has been observed to kill it with `STATUS_HEAP_CORRUPTION (0xC0000374)`.
 
-It survives when a real swap chain is found fast (GTA V, where the pointer sits
-in `GTA5.exe`'s `.data`) and gets dangerous when it keeps searching. This
-predates the D3D11 work and is unfixed. Note the awkward consequence: on GTA V
+It survives when a real swap chain is found fast and gets dangerous when it
+keeps searching. Both halves have been observed: GTA V, whose pointer sits in
+`GTA5.exe`'s `.data`, is hooked immediately and runs fine, and so is
+`d3d11_testapp` now that it keeps its swap chain in a global -- but injecting
+into a build whose swap chain lived only on the stack, where the scan finds
+nothing and keeps probing, killed it every time. This predates the D3D11 work
+and is unfixed. Note the awkward consequence: on GTA V
 this scan is the *only* mechanism that hooks anything, so the one path that
 makes GTA V work is also the unsafe one. Fixing it properly needs an
 export-level trampoline on `CreateDXGIFactory` / `D3D11CreateDeviceAndSwapChain`

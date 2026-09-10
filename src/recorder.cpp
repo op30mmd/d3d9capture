@@ -125,6 +125,7 @@ struct EncodeSession
                                         // g_RecordedFrames belongs to whichever
                                         // session is currently active
     bool           active      = false;
+    bool           warnedSizeMismatch = false;
     char           path[MAX_PATH] = "";
 };
 
@@ -261,6 +262,22 @@ static void CloseSession(EncodeSession& s)
 static bool EncodeFrame(EncodeSession& s, const QueuedFrame& frame)
 {
     if (!s.writer) return false;
+
+    // The sink writer is fixed at the size the session was opened with, so a
+    // frame of any other size cannot be encoded into it -- reading it as
+    // s.width x s.height would run past the end of frame.pixels. This happens
+    // when the game resizes (ResizeBuffers) while recording.
+    if (frame.width != s.width || frame.height != s.height)
+    {
+        if (!s.warnedSizeMismatch)
+        {
+            Log("[rec] Dropping %ux%u frame; this session encodes %ux%u "
+                "(resize while recording; stop and start again to capture at the new size)",
+                frame.width, frame.height, s.width, s.height);
+            s.warnedSizeMismatch = true;
+        }
+        return false;
+    }
 
     const DWORD frameBytes = s.width * s.height * 4;
     IMFMediaBuffer* buffer = nullptr;
@@ -638,7 +655,13 @@ void Recorder_OnFrameReady(const void* pixels, uint32_t width, uint32_t height,
     item.kind         = ItemKind::Frame;
     item.frame.width  = width;
     item.frame.height = height;
-    item.frame.stride = stride;
+    // The copy below de-strides into a tightly packed buffer, so the stride
+    // that describes frame.pixels is width*4, NOT the GPU stride we were handed.
+    // Storing the GPU stride here made the encoder read rows at the padded
+    // pitch out of a packed buffer and run off the end of it: at GTA V's
+    // 1366x768 the back buffer pitch is 5504 against a 5464-byte row, which
+    // overran the allocation by 30,680 bytes and crashed the game.
+    item.frame.stride = width * 4;
     item.frame.qpc    = static_cast<uint64_t>(now.QuadPart);
 
     {

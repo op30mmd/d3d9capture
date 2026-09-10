@@ -14,7 +14,7 @@
  *      /link d3d11.lib dxgi.lib user32.lib
  *
  * Usage:
- *   d3d11_testapp.exe [frames] [msaa] [test-polls]
+ *   d3d11_testapp.exe [frames] [msaa] [test-polls] [width] [height]
  *
  *   frames      real frames to present, default 600. Values >= 100 also drive a
  *               scripted sequence: overlay on/off, a recorder stop-then-restart
@@ -28,6 +28,13 @@
  *               minimised. Those calls present nothing, so the DLL must ignore
  *               them: with 900 frames and 50 polls the capture layer must
  *               report 900 presents, not 45,900.
+ *   width       back buffer size, default 640x480. Use a width that is NOT a
+ *   height      multiple of 16 (1366 is the natural choice, it is what GTA V
+ *               runs at) to get a padded GPU row pitch: 1366 maps at 5504
+ *               bytes per row against a 5464-byte row of pixels. At 640 and
+ *               800 the pitch happens to equal width*4, so the de-striding
+ *               path is never exercised and stride bugs stay invisible --
+ *               which is exactly how one reached a release and crashed GTA V.
  *
  * The frames it renders carry a white marker in the TOP-LEFT corner. A flat
  * colour cannot reveal a vertical flip, so checking that the marker is still
@@ -42,6 +49,13 @@
 #include <dxgi.h>
 #include <cstdio>
 #include <cstdlib>
+
+// Deliberately file-scope. The DLL's fallback hook path scans a module's .data
+// section for a live swap chain pointer, so a stack local is invisible to it and
+// late injection would find nothing. Real games keep theirs in globals, which is
+// why that scan is what ends up hooking GTA V. Keeping a copy here lets
+// --wait-for exercise the same path.
+static IDXGISwapChain* g_SwapChainForScan = nullptr;
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -65,6 +79,8 @@ int main(int argc, char* argv[])
     const int totalFrames = (argc > 1) ? atoi(argv[1]) : 600;
     const UINT msaa = (argc > 2) ? (UINT)atoi(argv[2]) : 1;
     const UINT testPolls = (argc > 3) ? (UINT)atoi(argv[3]) : 0;
+    const UINT bbWidth   = (argc > 4) ? (UINT)atoi(argv[4]) : 640;
+    const UINT bbHeight  = (argc > 5) ? (UINT)atoi(argv[5]) : 480;
     unsigned long long realPresents = 0, testPresents = 0;
 
     WNDCLASSA wc = {};
@@ -74,13 +90,13 @@ int main(int argc, char* argv[])
     RegisterClassA(&wc);
     HWND hwnd = CreateWindowA(wc.lpszClassName, "d3d11capture test app",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
-        640, 480, nullptr, nullptr, wc.hInstance, nullptr);
+        (int)bbWidth, (int)bbHeight, nullptr, nullptr, wc.hInstance, nullptr);
     if (!hwnd) { printf("[testapp] CreateWindow failed: %lu\n", GetLastError()); return 1; }
 
     DXGI_SWAP_CHAIN_DESC sd = {};
     sd.BufferCount = 2;
-    sd.BufferDesc.Width = 640;
-    sd.BufferDesc.Height = 480;
+    sd.BufferDesc.Width = bbWidth;
+    sd.BufferDesc.Height = bbHeight;
     sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     sd.BufferDesc.RefreshRate.Numerator = 60;
     sd.BufferDesc.RefreshRate.Denominator = 1;
@@ -115,6 +131,7 @@ int main(int argc, char* argv[])
         printf("[testapp] D3D11CreateDeviceAndSwapChain failed hr=0x%08lX\n", hr);
         return 1;
     }
+    g_SwapChainForScan = sc;
     printf("[testapp] device=%p swapchain=%p featureLevel=0x%04X\n",
         (void*)dev, (void*)sc, (unsigned)fl);
     fflush(stdout);
