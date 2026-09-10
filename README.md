@@ -87,7 +87,7 @@ consumer -- not the render thread -- sets the capture rate.
 | `imgui/` | Dear ImGui, as a git submodule |
 | `build.bat` | MSVC build script for 32-bit and 64-bit targets |
 | `tools/d3d9_testapp.cpp` | Minimal D3D9 app used as a verification target |
-| `tools/d3d11_testapp.cpp` | Minimal D3D11/DXGI verification target; can emulate MSAA and `DXGI_PRESENT_TEST` occlusion polling |
+| `tools/d3d11_testapp.cpp` | Minimal D3D11/DXGI verification target; can emulate MSAA, `DXGI_PRESENT_TEST` occlusion polling, and non-16-aligned widths that produce a padded GPU pitch |
 | `tools/mp4_frame.cpp` | Decodes frames from a recorded MP4 back to BMP, to verify output |
 | `tools/frida/` | Scripts that verify the hooks inside a live process |
 
@@ -269,6 +269,13 @@ inject_tool.exe --launch d3d11_testapp.exe d3d9capture.dll --wait 300 4
 ::    The DLL log must report presents=900, not 45,900.
 inject_tool.exe --launch d3d11_testapp.exe d3d9capture.dll --wait 900 1 50
 
+:: 3b. PADDED STRIDE. Always test a width that is not a multiple of 16, or a
+::     whole class of bug stays invisible: at 640 and 800 the GPU pitch happens
+::     to equal width*4, so nothing exercises the de-striding path. 1366 gives
+::     a 5504-byte pitch against a 5464-byte row, which is what crashed the
+::     recorder on GTA V. Run it WITH recording enabled.
+inject_tool.exe --launch d3d11_testapp.exe d3d9capture.dll --wait 400 1 0 1366 768
+
 :: 4. Recorder stop-then-restart: frame 76 stops and restarts in one frame.
 ::    The log must show one worker thread, no "WriteSample failed", a per-
 ::    session frame count, and the process must exit with code 0.
@@ -292,6 +299,16 @@ for the D3D9 path including a device `Reset()`.
   re-executes (GTA V). Use `--wait-for`; see *Launcher-stub games* above.
 - **Elevation**: if the game runs elevated, run both `inject_tool.exe` and
   `shm_reader.exe` elevated too, or the reader cannot signal the frame events.
+- **Row pitch**: the GPU pitch of a mapped back buffer is not `width * 4`. It
+  is padded for alignment whenever the width is not a multiple of 16 (GTA V at
+  1366 wide maps at 5504 bytes per row, not 5464). Frames are de-strided into a
+  packed buffer before they are queued, so anything downstream must use
+  `width * 4` and not the pitch the GPU reported. An H.264 *decoder* aligns the
+  same way on the way back out, which is why `tools/mp4_frame.cpp` reads its
+  output pitch instead of assuming one.
+- **Resolution changes while recording**: a sink writer is fixed at the size it
+  was opened with, so frames of a different size are dropped (and logged) rather
+  than encoded. Stop and start the recording to capture at the new size.
 - **Minimised / occluded windows**: capture is skipped for `DXGI_PRESENT_TEST`
   calls, but the DLL has no occlusion check of its own, so a minimised game that
   still issues real `Present` calls is captured (and read back) as usual.

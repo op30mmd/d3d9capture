@@ -130,7 +130,21 @@ int main(int argc, char* argv[])
                     // The decoder hands back RGB32 in the GDI bottom-up
                     // convention, so read rows from the bottom to recover a
                     // top-down image before writing it back out.
-                    const int32_t stride = static_cast<int32_t>(width) * 4;
+                    //
+                    // Do NOT assume rows are packed at width*4. An H.264
+                    // decoder aligns its output width (commonly to 16), so a
+                    // 1366-wide frame comes back with a 1376-pixel pitch of
+                    // 5504 bytes. Assuming width*4 there shears the image by
+                    // 10 pixels per row and looks exactly like a capture bug.
+                    int32_t stride = static_cast<int32_t>(width) * 4;
+                    if (height > 0 && (len % height) == 0)
+                    {
+                        const int32_t actual = static_cast<int32_t>(len / height);
+                        if (actual >= stride) stride = actual;
+                    }
+                    if (stride != static_cast<int32_t>(width) * 4)
+                        printf("[mp4] note: decoder pitch is %ld bytes, not %lu (width %u aligned up)\n",
+                               static_cast<long>(stride), static_cast<unsigned long>(width * 4), width);
                     char path[MAX_PATH];
                     _snprintf_s(path, sizeof(path), _TRUNCATE, "%s_%03d.bmp", prefix, emitted);
                     if (SaveBmp(path, data, width, height, stride))
