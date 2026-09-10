@@ -8,6 +8,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <objbase.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -122,7 +123,6 @@ static bool CreateSinkWriter(const char* path, uint32_t width, uint32_t height, 
         return false;
     }
 
-    // Output Type: H.264 Video in MP4 Container
     IMFMediaType* outType = nullptr;
     if (FAILED(MFCreateMediaType(&outType))) { g_pWriter->Release(); g_pWriter = nullptr; return false; }
     outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -142,7 +142,6 @@ static bool CreateSinkWriter(const char* path, uint32_t width, uint32_t height, 
         return false;
     }
 
-    // Input Type: RGB32 / BGRA (DirectX 9 Backbuffer format)
     IMFMediaType* inType = nullptr;
     if (FAILED(MFCreateMediaType(&inType))) { g_pWriter->Release(); g_pWriter = nullptr; return false; }
     inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -206,7 +205,6 @@ static bool EncodeFrameToSinkWriter(const QueuedFrame& frame)
     }
     sample->AddBuffer(buffer);
 
-    // Precise timestamping relative to baseQpc minus paused intervals
     uint64_t frameQpc = (frame.qpc >= g_TotalPausedQpc) ? (frame.qpc - g_TotalPausedQpc) : 0;
     if (g_BaseQpc == 0) g_BaseQpc = frameQpc;
 
@@ -236,6 +234,7 @@ static bool EncodeFrameToSinkWriter(const QueuedFrame& frame)
 // ── Background Worker Thread ─────────────────────────────────────────────────
 static void RecorderWorkerLoop()
 {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     Log("[rec] Background encoding worker thread started");
 
     while (g_WorkerRunning.load() || !g_FrameQueue.empty())
@@ -254,7 +253,6 @@ static void RecorderWorkerLoop()
             g_FrameQueue.pop_front();
         }
 
-        // Lazy initialize sink writer on first frame using actual viewport resolution
         if (!g_pWriter)
         {
             if (!CreateSinkWriter(g_CurrentPath, frame.width, frame.height, g_TargetFps, g_BitrateKbps))
@@ -267,7 +265,6 @@ static void RecorderWorkerLoop()
 
         EncodeFrameToSinkWriter(frame);
 
-        // Return vector to buffer pool for recycling
         {
             std::lock_guard<std::mutex> lock(g_QueueMtx);
             if (g_BufferPool.size() < MAX_QUEUE_FRAMES)
@@ -278,10 +275,9 @@ static void RecorderWorkerLoop()
         }
     }
 
-    // Finalize Sink Writer
     if (g_pWriter)
     {
-        Log("[rec] Finalizing MP4 sink writer...");
+        Log("[rec] Finalizing MP4 sink writer asynchronously...");
         HRESULT hr = g_pWriter->Finalize();
         if (FAILED(hr))
             Log("[rec] Finalize failed: 0x%08lX", hr);
@@ -291,7 +287,14 @@ static void RecorderWorkerLoop()
             static_cast<unsigned long long>(g_RecordedFrames.load()));
     }
 
+    {
+        std::lock_guard<std::mutex> lock(g_QueueMtx);
+        g_BufferPool.clear();
+        g_BufferPool.shrink_to_fit();
+    }
+
     Log("[rec] Background encoding worker thread finished");
+    CoUninitialize();
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -316,9 +319,9 @@ void Recorder_Shutdown()
 
 bool Recorder_Start(const char* customPath, uint32_t fps, uint32_t bitrateKbps)
 {
-    if (g_IsRecording.load())
+    if (g_IsRecording.load() || g_WorkerRunning.load())
     {
-        Log("[rec] Already recording; ignoring Start");
+        Log("[rec] Recorder is busy or active; ignoring Start");
         return false;
     }
 
@@ -341,7 +344,11 @@ bool Recorder_Start(const char* customPath, uint32_t fps, uint32_t bitrateKbps)
     QueryPerformanceCounter(&g_LastFrameQpc);
     g_RecordStartTick = GetTickCount();
 
-    // Start background worker
+    if (g_WorkerThread.joinable())
+    {
+        g_WorkerThread.join();
+    }
+
     g_WorkerRunning.store(true);
     g_WorkerThread = std::thread(RecorderWorkerLoop);
 
@@ -382,20 +389,22 @@ void Recorder_Stop()
 {
     if (!g_IsRecording.load() && !g_WorkerRunning.load()) return;
 
-    Log("[rec] Stopping recording...");
+    Log("[rec] Stopping recording (async)...");
     g_IsRecording.store(false);
     g_IsPaused.store(false);
 
-    // Stop worker and wait for queue flush
     g_WorkerRunning.store(false);
     g_QueueCv.notify_all();
 
     if (g_WorkerThread.joinable())
     {
-        g_WorkerThread.join();
+        std::thread finisher([](std::thread t) {
+            if (t.joinable()) t.join();
+        }, std::move(g_WorkerThread));
+        finisher.detach();
     }
 
-    Log("[rec] Recording stopped. File saved to: %s", g_CurrentPath);
+    Log("[rec] Recording stop initiated without blocking render thread.");
 }
 
 bool Recorder_IsRecording()
@@ -449,7 +458,7 @@ bool Recorder_WantsFrame()
         double minIntervalSec = 1.0 / static_cast<double>(g_TargetFps);
         if (elapsedSec < (minIntervalSec * 0.88))
         {
-            return false; // Framerate limiter pacing
+            return false;
         }
     }
     return true;
@@ -475,13 +484,11 @@ void Recorder_OnFrameReady(const void* pixels, uint32_t width, uint32_t height, 
     {
         std::unique_lock<std::mutex> lock(g_QueueMtx);
 
-        // Discard oldest frame if worker is overloaded to protect render thread
         if (g_FrameQueue.size() >= MAX_QUEUE_FRAMES)
         {
             g_FrameQueue.pop_front();
         }
 
-        // Reuse memory from buffer pool
         if (!g_BufferPool.empty())
         {
             frame.pixels = std::move(g_BufferPool.back());
@@ -492,7 +499,6 @@ void Recorder_OnFrameReady(const void* pixels, uint32_t width, uint32_t height, 
     if (frame.pixels.size() < byteSize)
         frame.pixels.resize(byteSize);
 
-    // Fast copy from render thread
     const BYTE* src = static_cast<const BYTE*>(pixels);
     BYTE* dst = frame.pixels.data();
     const DWORD rowBytes = width * 4;
