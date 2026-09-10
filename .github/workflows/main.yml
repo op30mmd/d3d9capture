@@ -3,9 +3,13 @@ name: Build d3d9capture
 on:
   push:
     branches: ["main", "master"]
-    paths:
-      - "src/**"
-      - ".github/workflows/build.yml"
+    # The release job below is gated on refs/tags/v*, but a tag push does not
+    # match a `branches` filter, so without this the workflow never started for
+    # a tag and the release job could never run at all.
+    tags: ["v*"]
+    # NOTE: deliberately no `paths` filter. A `paths` filter also applies to tag
+    # pushes, so tagging a commit that happens not to touch src/** would silently
+    # skip the release build.
   pull_request:
     branches: ["main", "master"]
   workflow_dispatch:   # allow manual trigger from the Actions tab
@@ -52,8 +56,8 @@ jobs:
              /Fe:bin\d3d9capture.dll ^
              dllmain.cpp capture.cpp consumer_backend.cpp recorder.cpp overlay.cpp ^
              imgui\imgui.cpp imgui\imgui_draw.cpp imgui\imgui_widgets.cpp imgui\imgui_tables.cpp imgui\imgui_demo.cpp ^
-             imgui\backends\imgui_impl_win32.cpp imgui_impl_dx9_patched.cpp ^
-             /link d3d9.lib user32.lib gdi32.lib kernel32.lib dxguid.lib shell32.lib mfplat.lib mfuuid.lib mfreadwrite.lib ole32.lib
+             imgui\backends\imgui_impl_win32.cpp imgui\backends\imgui_impl_dx11.cpp imgui_impl_dx9_patched.cpp ^
+             /link d3d9.lib d3d11.lib dxgi.lib d3dcompiler.lib dwmapi.lib user32.lib gdi32.lib kernel32.lib dxguid.lib shell32.lib mfplat.lib mfuuid.lib mfreadwrite.lib ole32.lib
 
       # ── 5. Build inject_tool.exe ───────────────────────────────────────────
       - name: Build inject_tool.exe
@@ -92,7 +96,24 @@ jobs:
             Write-Host "OK  $f  ($size bytes)"
           }
 
-      # ── 8. Upload artifacts ────────────────────────────────────────────────
+      # ── 8. Build the verification tools ────────────────────────────────────
+      # Not shipped in the release zips; compiled so they cannot bitrot. They are
+      # the documented way to verify a capture change (see "Verifying a change"
+      # in the README).
+      - name: Build verification tools
+        working-directory: src
+        shell: cmd
+        run: |
+          cl /nologo /W3 /WX /O2 /MD /Fo:bin\ /Fe:bin\d3d9_testapp.exe ..\tools\d3d9_testapp.cpp ^
+             /link d3d9.lib user32.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /W3 /WX /O2 /MD /Fo:bin\ /Fe:bin\d3d11_testapp.exe ..\tools\d3d11_testapp.cpp ^
+             /link d3d11.lib dxgi.lib user32.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /W3 /WX /O2 /MT /Fo:bin\ /Fe:bin\mp4_frame.exe ..\tools\mp4_frame.cpp
+          if errorlevel 1 exit /b 1
+
+      # ── 9. Upload artifacts ────────────────────────────────────────────────
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
