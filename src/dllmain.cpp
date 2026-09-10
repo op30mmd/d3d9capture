@@ -331,7 +331,12 @@ static HRESULT WINAPI Hooked_ResetEx(
 static HRESULT WINAPI Hooked_DXGISwapChainPresent(
     IDXGISwapChain* pChain, UINT SyncInterval, UINT Flags)
 {
-    if (g_InsidePresent)
+    // DXGI_PRESENT_TEST does not present: the back buffer is left untouched and
+    // no frame is produced.  A game polls it in a tight loop while its window is
+    // occluded or minimised to find out when it becomes visible again, so
+    // counting these as frames inflates the reported FPS by orders of magnitude
+    // and capturing them hands the consumer a buffer that was never presented.
+    if ((Flags & DXGI_PRESENT_TEST) || g_InsidePresent)
         return g_OrigDXGISwapChainPresent(pChain, SyncInterval, Flags);
 
     g_InsidePresent = true;
