@@ -5,7 +5,7 @@ on:
     branches: ["main", "master"]
     paths:
       - "src/**"
-      - ".github/workflows/build.yml"
+      - ".github/workflows/main.yml"
   pull_request:
     branches: ["main", "master"]
   workflow_dispatch:   # allow manual trigger from the Actions tab
@@ -52,8 +52,8 @@ jobs:
              /Fe:bin\d3d9capture.dll ^
              dllmain.cpp capture.cpp consumer_backend.cpp recorder.cpp overlay.cpp ^
              imgui\imgui.cpp imgui\imgui_draw.cpp imgui\imgui_widgets.cpp imgui\imgui_tables.cpp imgui\imgui_demo.cpp ^
-             imgui\backends\imgui_impl_win32.cpp imgui_impl_dx9_patched.cpp ^
-             /link d3d9.lib user32.lib gdi32.lib kernel32.lib dxguid.lib shell32.lib mfplat.lib mfuuid.lib mfreadwrite.lib ole32.lib
+             imgui\backends\imgui_impl_win32.cpp imgui\backends\imgui_impl_dx11.cpp imgui_impl_dx9_patched.cpp ^
+             /link d3d9.lib d3d11.lib dxgi.lib d3dcompiler.lib dwmapi.lib user32.lib gdi32.lib kernel32.lib dxguid.lib shell32.lib mfplat.lib mfuuid.lib mfreadwrite.lib ole32.lib
 
       # ── 5. Build inject_tool.exe ───────────────────────────────────────────
       - name: Build inject_tool.exe
