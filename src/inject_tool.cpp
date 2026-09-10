@@ -4,6 +4,7 @@
  * Usage:
  *   inject_tool.exe  <pid | process-name>  <full-path-to-dll>
  *   inject_tool.exe  --launch <game.exe> <full-path-to-dll> [-- game arguments]
+ *   inject_tool.exe  --wait-for <process.exe> <full-path-to-dll> [--timeout <sec>]
  *
  * Build:
  *   cl /nologo /W3 /O2 /MT /Fe:inject_tool.exe inject_tool.cpp
@@ -51,6 +52,59 @@ static DWORD FindPidByName(const char* name)
 
     CloseHandle(hSnap);
     return pid;
+}
+
+// Collect every PID with this image name, not just the first.  A game whose
+// launcher re-executes the real renderer under the SAME name (GTA V ships
+// GTA5.exe as a stub that spawns PlayGTAV.exe, which spawns the real GTA5.exe)
+// produces several matches, and only one of them is the renderer.
+static int FindPidsByName(const char* name, DWORD* out, int maxOut)
+{
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return 0;
+
+    PROCESSENTRY32 pe = { sizeof(pe) };
+    int count = 0;
+    if (Process32First(hSnap, &pe))
+    {
+        do {
+            if (_stricmp(pe.szExeFile, name) == 0 && count < maxOut)
+                out[count++] = pe.th32ProcessID;
+        } while (Process32Next(hSnap, &pe) && count < maxOut);
+    }
+    CloseHandle(hSnap);
+    return count;
+}
+
+/**
+ * Has this process actually loaded a Direct3D runtime?
+ *
+ * This is what separates the real renderer from a launcher stub sharing its
+ * name: the stub never touches d3d9/d3d11/dxgi.  It is also the readiness
+ * signal we want, because the DLL's fallback swap-chain scan needs the graphics
+ * runtime to be up before it can find anything.
+ */
+static bool ProcessHasRenderer(DWORD pid)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    if (snap == INVALID_HANDLE_VALUE) return false;  // starting up, or no access
+
+    MODULEENTRY32 me = { sizeof(me) };
+    bool found = false;
+    if (Module32First(snap, &me))
+    {
+        do {
+            if (_stricmp(me.szModule, "d3d11.dll") == 0 ||
+                _stricmp(me.szModule, "dxgi.dll")  == 0 ||
+                _stricmp(me.szModule, "d3d9.dll")  == 0)
+            {
+                found = true;
+                break;
+            }
+        } while (Module32Next(snap, &me));
+    }
+    CloseHandle(snap);
+    return found;
 }
 
 static bool EnableDebugPrivilege()
@@ -185,16 +239,106 @@ static HANDLE CreateCaptureReadyEvent(DWORD pid)
 // ── entry point ───────────────────────────────────────────────────────────────
 int main(int argc, char* argv[])
 {
-    const bool launchMode = argc >= 4 && strcmp(argv[1], "--launch") == 0;
-    if ((!launchMode && argc != 3) || (launchMode && argc < 4))
+    const bool launchMode  = argc >= 4 && strcmp(argv[1], "--launch") == 0;
+    const bool waitForMode = argc >= 4 && strcmp(argv[1], "--wait-for") == 0;
+    if ((!launchMode && !waitForMode && argc != 3) ||
+        ((launchMode || waitForMode) && argc < 4))
     {
         printf("Usage:\n");
         printf("  inject_tool.exe <pid | process.exe> <full-path-to-dll>\n");
         printf("  inject_tool.exe --launch <game.exe> <full-path-to-dll> [-- game arguments]\n");
+        printf("  inject_tool.exe --wait-for <process.exe> <full-path-to-dll> [--timeout <sec>]\n");
+        printf("\n");
+        printf("  --launch   inject before the renderer starts.  Does NOT work for games\n");
+        printf("             whose exe is a launcher stub that re-executes the real game\n");
+        printf("             (GTA V): the DLL lands in a process that immediately exits.\n");
+        printf("  --wait-for start the game normally, then use this: it waits for a process\n");
+        printf("             of that name which has actually loaded d3d9/d3d11/dxgi and\n");
+        printf("             injects into that one, skipping launcher stubs.\n");
         return 1;
     }
 
     EnableDebugPrivilege();
+
+    // --wait-for is the answer for launcher-stub games: poll until a process of
+    // the given name has a Direct3D runtime mapped, which is both the proof that
+    // it is the renderer and the point at which the DLL's swap-chain scan can
+    // succeed.
+    if (waitForMode)
+    {
+        const char* targetName = argv[2];
+        char dllPath[MAX_PATH] = {};
+        if (!GetFullPathNameA(argv[3], MAX_PATH, dllPath, nullptr) ||
+            GetFileAttributesA(dllPath) == INVALID_FILE_ATTRIBUTES)
+        {
+            printf("[inject] DLL not found: %s\n", argv[3]);
+            return 1;
+        }
+
+        unsigned timeoutSec = 300;
+        for (int i = 4; i + 1 < argc; ++i)
+            if (strcmp(argv[i], "--timeout") == 0)
+                timeoutSec = (unsigned)atoi(argv[i + 1]);
+
+        printf("[inject] Waiting up to %u s for \"%s\" to load a Direct3D runtime ...\n",
+               timeoutSec, targetName);
+
+        DWORD tried[64] = {};
+        int   nTried = 0;
+        const DWORD deadline = GetTickCount() + timeoutSec * 1000;
+        bool announced = false;
+
+        for (;;)
+        {
+            DWORD pids[64] = {};
+            const int n = FindPidsByName(targetName, pids, 64);
+
+            if (n > 0 && !announced)
+            {
+                printf("[inject] Found %d process(es) named \"%s\"; waiting for the renderer ...\n",
+                       n, targetName);
+                announced = true;
+            }
+
+            for (int i = 0; i < n; ++i)
+            {
+                bool seen = false;
+                for (int t = 0; t < nTried; ++t)
+                    if (tried[t] == pids[i]) { seen = true; break; }
+                if (seen || !ProcessHasRenderer(pids[i])) continue;
+
+                if (nTried < 64) tried[nTried++] = pids[i];
+
+                printf("[inject] PID %lu has a Direct3D runtime loaded - injecting.\n", pids[i]);
+                HANDLE readyEvent = CreateCaptureReadyEvent(pids[i]);
+                if (!Inject(pids[i], dllPath))
+                {
+                    if (readyEvent) CloseHandle(readyEvent);
+                    printf("[inject] Injection into PID %lu failed; still watching.\n", pids[i]);
+                    continue;
+                }
+
+                if (readyEvent)
+                {
+                    printf("[inject] Waiting for capture worker readiness ...\n");
+                    const DWORD w = WaitForSingleObject(readyEvent, 10000);
+                    CloseHandle(readyEvent);
+                    if (w != WAIT_OBJECT_0)
+                        printf("[inject] WARNING: capture worker did not signal readiness (wait=%lu).\n", w);
+                }
+                printf("[inject] SUCCESS: injected into PID %lu.\n", pids[i]);
+                return 0;
+            }
+
+            if (GetTickCount() >= deadline)
+            {
+                printf("[inject] Timed out after %u s; no \"%s\" process loaded a Direct3D runtime.\n",
+                       timeoutSec, targetName);
+                return 1;
+            }
+            Sleep(250);
+        }
+    }
 
     // --launch creates the game with its primary thread suspended, injects
     // before any game code can create D3D9, then resumes it.  This is the
@@ -268,6 +412,11 @@ int main(int argc, char* argv[])
         if (!injected)
         {
             printf("[inject] Injection failed; terminating suspended process.\n");
+            printf("[inject] HINT: if this game exe is a launcher stub that re-executes\n"
+                   "               the real renderer (GTA V does this), --launch cannot work.\n"
+                   "               Start the game normally, then use:\n"
+                   "                 inject_tool.exe --wait-for <renderer.exe> <dll>\n");
+
             CloseHandle(readyEvent);
             TerminateProcess(pi.hProcess, 1);
             CloseHandle(pi.hThread);
@@ -281,6 +430,11 @@ int main(int argc, char* argv[])
         if (readyWait != WAIT_OBJECT_0)
         {
             printf("[inject] Capture worker did not become ready (wait=%lu); refusing to resume.\n", readyWait);
+            printf("[inject] HINT: if this game exe is a launcher stub that re-executes\n"
+                   "               the real renderer (GTA V does this), --launch cannot work.\n"
+                   "               Start the game normally, then use:\n"
+                   "                 inject_tool.exe --wait-for <renderer.exe> <dll>\n");
+
             TerminateProcess(pi.hProcess, 1);
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
@@ -297,6 +451,20 @@ int main(int argc, char* argv[])
         }
         printf("[inject] SUCCESS: resumed PID %lu after injection.\n", pi.dwProcessId);
         CloseHandle(pi.hThread);
+
+        // A launcher stub re-executes the real game and exits almost at once,
+        // taking our DLL with it.  Say so plainly rather than leaving the user
+        // with a "successful" injection into a process that no longer exists.
+        if (!waitExit && WaitForSingleObject(pi.hProcess, 3000) == WAIT_OBJECT_0)
+        {
+            DWORD earlyCode = 0;
+            GetExitCodeProcess(pi.hProcess, &earlyCode);
+            printf("[inject] WARNING: PID %lu exited within 3 s (code %lu).\n",
+                   pi.dwProcessId, earlyCode);
+            printf("[inject] That usually means it was a launcher stub, so the DLL went with it.\n");
+            printf("[inject] Use:  inject_tool.exe --wait-for <renderer.exe> <dll>\n");
+        }
+
         if (waitExit)
         {
             WaitForSingleObject(pi.hProcess, INFINITE);
