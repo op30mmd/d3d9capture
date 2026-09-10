@@ -88,7 +88,7 @@ consumer -- not the render thread -- sets the capture rate.
 | `build.bat` | MSVC build script for 32-bit and 64-bit targets |
 | `tools/d3d9_testapp.cpp` | Minimal D3D9 app used as a verification target |
 | `tools/d3d11_testapp.cpp` | Minimal D3D11/DXGI verification target; can emulate MSAA, `DXGI_PRESENT_TEST` occlusion polling, and non-16-aligned widths that produce a padded GPU pitch |
-| `tools/mp4_frame.cpp` | Decodes frames from a recorded MP4 back to BMP, to verify output |
+| `tools/mp4_frame.cpp` | Decodes frames from a recorded MP4 back to BMP, to verify output; reads the decoder's real row pitch rather than assuming packed rows |
 | `tools/frida/` | Scripts that verify the hooks inside a live process |
 
 ---
@@ -264,6 +264,24 @@ would leave a recording unfinalised.
 
 ---
 
+### 4. Overlay init is reachable from two threads
+`Overlay_Init` / `Overlay_InitDXGI` can be entered concurrently: the DLL's worker
+thread calls them as soon as it installs hooks (including from the fallback
+scan), and the game's render thread reaches the same init from inside `Present`.
+Checking the "initialised" flag alone is not enough, because it is only set at
+the *end* of init -- the window covers `CreateContext`, both ImGui backend inits
+and the `WndProc` hook.
+
+Running the `WndProc` hook twice is what kills the process: the second
+`SetWindowLongPtr` returns the `HookedWndProc` already installed and stores it as
+the "original", so `CallWindowProc` recurses into itself until the stack goes.
+Init is therefore serialised with a mutex and re-checks the flag under it.
+`Overlay_Shutdown` deliberately does **not** take that mutex -- it runs from
+`DllMain` under the loader lock, and init can load DLLs, so locking there would
+risk a deadlock instead.
+
+---
+
 ## Verifying a change
 
 The two test apps let the whole chain be exercised without a real game. Build
@@ -300,6 +318,15 @@ inject_tool.exe --launch d3d11_testapp.exe d3d9capture.dll --wait 200 1 0
 
 :: 5. Recorded output really decodes, right way up:
 mp4_frame.exe C:\d3d9capture\recordings\<file>.mp4 frame_ 3 5
+
+:: 6. The FALLBACK SCAN path, which is the only thing that hooks GTA V.
+::    --launch never reaches it: the import hook succeeds first, and the
+::    poll then waits for the game's own creation instead of probing memory.
+::    Start the app first and attach late, so the worker thread hooks from
+::    the scan while the render thread is already presenting -- which is
+::    also the arrangement that exposes the overlay double-init race.
+d3d11_testapp.exe 600 1 0 1366 768
+inject_tool.exe --wait-for d3d11_testapp.exe d3d9capture.dll --timeout 30
 ```
 
 The D3D9 equivalent (`tools/d3d9_testapp.cpp`, built x86) covers the same ground
@@ -340,9 +367,13 @@ object*, and the resulting `QueryInterface` / `Release` can corrupt the target's
 heap: injecting into a process where the scan does not quickly find a real swap
 chain has been observed to kill it with `STATUS_HEAP_CORRUPTION (0xC0000374)`.
 
-It survives when a real swap chain is found fast (GTA V, where the pointer sits
-in `GTA5.exe`'s `.data`) and gets dangerous when it keeps searching. This
-predates the D3D11 work and is unfixed. Note the awkward consequence: on GTA V
+It survives when a real swap chain is found fast and gets dangerous when it
+keeps searching. Both halves have been observed: GTA V, whose pointer sits in
+`GTA5.exe`'s `.data`, is hooked immediately and runs fine, and so is
+`d3d11_testapp` now that it keeps its swap chain in a global -- but injecting
+into a build whose swap chain lived only on the stack, where the scan finds
+nothing and keeps probing, killed it every time. This predates the D3D11 work
+and is unfixed. Note the awkward consequence: on GTA V
 this scan is the *only* mechanism that hooks anything, so the one path that
 makes GTA V work is also the unsafe one. Fixing it properly needs an
 export-level trampoline on `CreateDXGIFactory` / `D3D11CreateDeviceAndSwapChain`
