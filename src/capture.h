@@ -10,8 +10,9 @@
  *
  * Lifecycle (called from dllmain.cpp):
  *   Capture_Init()            – consumer one-time setup (consumer_backend.cpp)
- *   Capture_OnPresent()       – called every frame inside hooked Present
- *   Capture_OnPreReset()      – releases staging surfaces before Reset
+ *   Capture_OnPresent()       – called every frame inside hooked Present (D3D9)
+ *   Capture_OnPresentDXGI()   – called every frame inside hooked Present (D3D11/DXGI)
+ *   Capture_OnPreReset()      – releases staging surfaces before Reset / ResizeBuffers
  *   Capture_OnPostReset()     – surfaces re-created lazily on next Present
  *   Capture_Shutdown()        – consumer teardown; must call Capture_ReleaseSurfaces()
  *
@@ -22,6 +23,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
+#include <d3d11.h>
+#include <dxgi.h>
 
 // ── logging helper (defined in dllmain.cpp) ──────────────────────────────────
 void Log(const char* fmt, ...);
@@ -29,8 +32,10 @@ void Log(const char* fmt, ...);
 // ── public API (Capture_Init / Capture_Shutdown defined in consumer_backend.cpp)
 void Capture_Init();
 void Capture_OnPresent(IDirect3DDevice9* pDev);
+void Capture_OnPresentDXGI(IDXGISwapChain* pSwapChain);
 void Capture_OnPreReset();
 void Capture_OnPostReset(IDirect3DDevice9* pDev);
+void Capture_OnPostResetDXGI(IDXGISwapChain* pSwapChain);
 void Capture_Shutdown();
 
 // ── internal helper implemented in capture.cpp, called by Capture_Shutdown() ──
@@ -54,7 +59,7 @@ struct FrameData
     UINT        width;
     UINT        height;
     UINT        stride;   // bytes per row (may be > width*4 due to GPU alignment)
-    D3DFORMAT   format;   // typically D3DFMT_A8R8G8B8 or D3DFMT_X8R8G8B8
+    UINT32      format;   // D3DFORMAT or DXGI_FORMAT value
     UINT64      frameIdx; // monotonically increasing counter
 };
 
@@ -64,7 +69,7 @@ struct CaptureStats
     UINT64    capturedFrames;
     UINT      width;
     UINT      height;
-    D3DFORMAT format;
+    UINT32    format;
     float     presentFps;
     float     captureFps;
     float     readbackMs;
