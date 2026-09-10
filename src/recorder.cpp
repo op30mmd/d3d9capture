@@ -4,6 +4,19 @@
  * Implements Media Foundation IMFSinkWriter video recording with an
  * asynchronous thread worker and bounded ring queue to guarantee 0 FPS loss
  * on the game's render thread.
+ *
+ * Threading model
+ * ───────────────
+ * Exactly one worker thread lives for as long as the recorder is initialised.
+ * Start and Stop do not create or join threads; they push BeginSession /
+ * EndSession markers into the same queue the frames travel through.  Because a
+ * single thread drains that queue in order, a stop followed immediately by a
+ * start is handled strictly sequentially: the old session is always finalised
+ * before the new one opens, so two encoding sessions can never share the sink
+ * writer.  The render thread never blocks on encoding or on finalisation.
+ *
+ * All sink-writer state lives in the worker-local EncodeSession; nothing that
+ * the encoder touches is a shared global.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -15,6 +28,7 @@
 #include <mferror.h>
 
 #include <cstdio>
+#include <cstdarg>
 #include <cstdint>
 #include <cstring>
 #include <atomic>
@@ -45,39 +59,91 @@ struct QueuedFrame
     uint64_t qpc = 0;
 };
 
+// Frames and session control share one queue so their relative order is
+// preserved: frames queued before a stop still reach the file, and frames
+// queued after the next start cannot leak into the previous recording.
+enum class ItemKind { Frame, BeginSession, EndSession };
+
+struct QueuedItem
+{
+    ItemKind    kind = ItemKind::Frame;
+    QueuedFrame frame;                  // ItemKind::Frame only
+    char        path[MAX_PATH] = "";    // ItemKind::BeginSession only
+    uint32_t    fps = 30;               // ItemKind::BeginSession only
+    uint32_t    bitrateKbps = 8000;     // ItemKind::BeginSession only
+};
+
 // ── State ────────────────────────────────────────────────────────────────────
-static std::atomic<bool>    g_MfInitialized{ false };
-static std::atomic<bool>    g_IsRecording{ false };
-static std::atomic<bool>    g_IsPaused{ false };
+static std::atomic<bool>     g_MfInitialized{ false };
+static std::atomic<bool>     g_IsRecording{ false };
+static std::atomic<bool>     g_IsPaused{ false };
 static std::atomic<uint64_t> g_RecordedFrames{ 0 };
 
-static uint32_t             g_TargetFps = 30;
-static uint32_t             g_BitrateKbps = 8000;
-static char                 g_CurrentPath[MAX_PATH] = "";
+// Published for the overlay's stats panel; written by whichever thread owns
+// the value, so they are atomic rather than plain scalars.
+static std::atomic<uint32_t> g_TargetFps{ 30 };
+static std::atomic<uint32_t> g_BitrateKbps{ 8000 };
+static std::atomic<uint32_t> g_EncoderWidth{ 0 };
+static std::atomic<uint32_t> g_EncoderHeight{ 0 };
+
+static char                 g_CurrentPath[MAX_PATH] = ""; // render thread only
+
+static std::mutex           g_ErrMtx;                     // guards g_LastError
 static char                 g_LastError[128] = "";
 
-static LARGE_INTEGER        g_QpcFreq = {};
-static LARGE_INTEGER        g_LastFrameQpc = {};
-static uint64_t             g_BaseQpc = 0;
+static LARGE_INTEGER        g_QpcFreq = {};               // set once in Init
+static LARGE_INTEGER        g_LastFrameQpc = {};          // render thread only
+static std::atomic<uint64_t> g_TotalPausedQpc{ 0 };       // producer writes, worker reads
 static uint64_t             g_PauseStartQpc = 0;
-static uint64_t             g_TotalPausedQpc = 0;
 static DWORD                g_RecordStartTick = 0;
 static DWORD                g_TotalPausedMs = 0;
 static DWORD                g_PauseStartTick = 0;
 
-static std::mutex           g_QueueMtx;
-static std::condition_variable g_QueueCv;
-static std::deque<QueuedFrame> g_FrameQueue;
+static std::mutex                        g_QueueMtx;
+static std::condition_variable           g_QueueCv;
+static std::deque<QueuedItem>            g_Queue;
 static std::vector<std::vector<uint8_t>> g_BufferPool; // Reusable allocations
-static std::thread          g_WorkerThread;
-static std::atomic<bool>    g_WorkerRunning{ false };
+static std::atomic<bool>                 g_WorkerRunning{ false };
 
-static IMFSinkWriter*       g_pWriter = nullptr;
-static DWORD                g_StreamIndex = 0;
-static uint32_t             g_EncoderWidth = 0;
-static uint32_t             g_EncoderHeight = 0;
+// The worker is detached rather than held in a std::thread: this DLL is never
+// unloaded in the normal flow, so a std::thread member that is still joinable
+// when static destructors run would call std::terminate() and take the game
+// down at exit. Shutdown waits on this flag instead of joining.
+static std::atomic<bool>                 g_WorkerFinished{ true };
+
+// Everything the encoder touches, owned solely by the worker thread.
+struct EncodeSession
+{
+    IMFSinkWriter* writer      = nullptr;
+    DWORD          streamIndex = 0;
+    uint32_t       width       = 0;
+    uint32_t       height      = 0;
+    uint32_t       fps         = 30;
+    uint32_t       bitrateKbps = 8000;
+    uint64_t       baseQpc     = 0;
+    uint64_t       framesWritten = 0;   // this session only; the published
+                                        // g_RecordedFrames belongs to whichever
+                                        // session is currently active
+    bool           active      = false;
+    char           path[MAX_PATH] = "";
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+static void SetRecorderError(const char* fmt, ...)
+{
+    char msg[sizeof(g_LastError)] = "";
+    if (fmt && *fmt)
+    {
+        va_list args;
+        va_start(args, fmt);
+        _vsnprintf_s(msg, sizeof(msg), _TRUNCATE, fmt, args);
+        va_end(args);
+        Log("[rec] %s", msg);
+    }
+    std::lock_guard<std::mutex> lock(g_ErrMtx);
+    strncpy_s(g_LastError, sizeof(g_LastError), msg, _TRUNCATE);
+}
+
 static void GenerateDefaultFileName(char* dst, size_t maxLen)
 {
     CreateDirectoryA("C:\\d3d9capture", nullptr);
@@ -103,85 +169,100 @@ static bool InitMediaFoundation()
     return true;
 }
 
-static bool CreateSinkWriter(const char* path, uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrateKbps)
+// ── Session lifecycle (worker thread only) ───────────────────────────────────
+static bool OpenSession(EncodeSession& s, uint32_t width, uint32_t height)
 {
     wchar_t wpath[MAX_PATH] = {};
-    MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH);
+    MultiByteToWideChar(CP_ACP, 0, s.path, -1, wpath, MAX_PATH);
 
     IMFAttributes* attrs = nullptr;
     if (FAILED(MFCreateAttributes(&attrs, 2))) return false;
     attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
     attrs->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
 
-    HRESULT hr = MFCreateSinkWriterFromURL(wpath, nullptr, attrs, &g_pWriter);
+    HRESULT hr = MFCreateSinkWriterFromURL(wpath, nullptr, attrs, &s.writer);
     attrs->Release();
     if (FAILED(hr))
     {
-        _snprintf_s(g_LastError, sizeof(g_LastError), _TRUNCATE, "MFCreateSinkWriterFromURL failed: 0x%08lX", hr);
-        Log("[rec] %s", g_LastError);
-        g_pWriter = nullptr;
+        SetRecorderError("MFCreateSinkWriterFromURL failed: 0x%08lX", hr);
+        s.writer = nullptr;
         return false;
     }
 
     IMFMediaType* outType = nullptr;
-    if (FAILED(MFCreateMediaType(&outType))) { g_pWriter->Release(); g_pWriter = nullptr; return false; }
+    if (FAILED(MFCreateMediaType(&outType))) { s.writer->Release(); s.writer = nullptr; return false; }
     outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     outType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-    outType->SetUINT32(MF_MT_AVG_BITRATE, bitrateKbps * 1000);
+    outType->SetUINT32(MF_MT_AVG_BITRATE, s.bitrateKbps * 1000);
     outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     MFSetAttributeSize(outType, MF_MT_FRAME_SIZE, width, height);
-    MFSetAttributeRatio(outType, MF_MT_FRAME_RATE, fps, 1);
+    MFSetAttributeRatio(outType, MF_MT_FRAME_RATE, s.fps, 1);
     MFSetAttributeRatio(outType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-    hr = g_pWriter->AddStream(outType, &g_StreamIndex);
+    hr = s.writer->AddStream(outType, &s.streamIndex);
     outType->Release();
     if (FAILED(hr))
     {
-        _snprintf_s(g_LastError, sizeof(g_LastError), _TRUNCATE, "AddStream H264 failed: 0x%08lX", hr);
-        Log("[rec] %s", g_LastError);
-        g_pWriter->Release(); g_pWriter = nullptr;
+        SetRecorderError("AddStream H264 failed: 0x%08lX", hr);
+        s.writer->Release(); s.writer = nullptr;
         return false;
     }
 
     IMFMediaType* inType = nullptr;
-    if (FAILED(MFCreateMediaType(&inType))) { g_pWriter->Release(); g_pWriter = nullptr; return false; }
+    if (FAILED(MFCreateMediaType(&inType))) { s.writer->Release(); s.writer = nullptr; return false; }
     inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     inType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
     inType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     inType->SetUINT32(MF_MT_DEFAULT_STRIDE, width * 4);
     MFSetAttributeSize(inType, MF_MT_FRAME_SIZE, width, height);
-    MFSetAttributeRatio(inType, MF_MT_FRAME_RATE, fps, 1);
+    MFSetAttributeRatio(inType, MF_MT_FRAME_RATE, s.fps, 1);
     MFSetAttributeRatio(inType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-    hr = g_pWriter->SetInputMediaType(g_StreamIndex, inType, nullptr);
+    hr = s.writer->SetInputMediaType(s.streamIndex, inType, nullptr);
     inType->Release();
     if (FAILED(hr))
     {
-        _snprintf_s(g_LastError, sizeof(g_LastError), _TRUNCATE, "SetInputMediaType failed: 0x%08lX", hr);
-        Log("[rec] %s", g_LastError);
-        g_pWriter->Release(); g_pWriter = nullptr;
+        SetRecorderError("SetInputMediaType failed: 0x%08lX", hr);
+        s.writer->Release(); s.writer = nullptr;
         return false;
     }
 
-    hr = g_pWriter->BeginWriting();
+    hr = s.writer->BeginWriting();
     if (FAILED(hr))
     {
-        _snprintf_s(g_LastError, sizeof(g_LastError), _TRUNCATE, "BeginWriting failed: 0x%08lX", hr);
-        Log("[rec] %s", g_LastError);
-        g_pWriter->Release(); g_pWriter = nullptr;
+        SetRecorderError("BeginWriting failed: 0x%08lX", hr);
+        s.writer->Release(); s.writer = nullptr;
         return false;
     }
 
-    g_EncoderWidth = width;
-    g_EncoderHeight = height;
+    s.width  = width;
+    s.height = height;
+    g_EncoderWidth.store(width);
+    g_EncoderHeight.store(height);
     Log("[rec] IMFSinkWriter initialized: %ux%u @ %u fps, %u kbps -> %s",
-        width, height, fps, bitrateKbps, path);
+        width, height, s.fps, s.bitrateKbps, s.path);
     return true;
 }
 
-static bool EncodeFrameToSinkWriter(const QueuedFrame& frame)
+static void CloseSession(EncodeSession& s)
 {
-    if (!g_pWriter) return false;
+    if (s.writer)
+    {
+        Log("[rec] Finalizing MP4 sink writer ...");
+        HRESULT hr = s.writer->Finalize();
+        if (FAILED(hr))
+            SetRecorderError("Finalize failed: 0x%08lX", hr);
+        s.writer->Release();
+        s.writer = nullptr;
+        Log("[rec] Finalized. Total recorded frames: %llu -> %s",
+            static_cast<unsigned long long>(s.framesWritten), s.path);
+    }
+    s.active = false;
+}
 
-    const DWORD frameBytes = g_EncoderWidth * g_EncoderHeight * 4;
+static bool EncodeFrame(EncodeSession& s, const QueuedFrame& frame)
+{
+    if (!s.writer) return false;
+
+    const DWORD frameBytes = s.width * s.height * 4;
     IMFMediaBuffer* buffer = nullptr;
     HRESULT hr = MFCreateMemoryBuffer(frameBytes, &buffer);
     if (FAILED(hr) || !buffer) return false;
@@ -193,7 +274,7 @@ static bool EncodeFrameToSinkWriter(const QueuedFrame& frame)
         return false;
     }
 
-    MFCopyImage(dst, g_EncoderWidth * 4, frame.pixels.data(), frame.stride, g_EncoderWidth * 4, g_EncoderHeight);
+    MFCopyImage(dst, s.width * 4, frame.pixels.data(), frame.stride, s.width * 4, s.height);
     buffer->Unlock();
     buffer->SetCurrentLength(frameBytes);
 
@@ -205,19 +286,20 @@ static bool EncodeFrameToSinkWriter(const QueuedFrame& frame)
     }
     sample->AddBuffer(buffer);
 
-    uint64_t frameQpc = (frame.qpc >= g_TotalPausedQpc) ? (frame.qpc - g_TotalPausedQpc) : 0;
-    if (g_BaseQpc == 0) g_BaseQpc = frameQpc;
+    const uint64_t pausedQpc = g_TotalPausedQpc.load();
+    uint64_t frameQpc = (frame.qpc >= pausedQpc) ? (frame.qpc - pausedQpc) : 0;
+    if (s.baseQpc == 0) s.baseQpc = frameQpc;
 
     LONGLONG sampleTime = 0;
-    if (g_QpcFreq.QuadPart > 0 && frameQpc >= g_BaseQpc)
+    if (g_QpcFreq.QuadPart > 0 && frameQpc >= s.baseQpc)
     {
         sampleTime = static_cast<LONGLONG>(
-            ((frameQpc - g_BaseQpc) * 10000000ULL) / static_cast<uint64_t>(g_QpcFreq.QuadPart));
+            ((frameQpc - s.baseQpc) * 10000000ULL) / static_cast<uint64_t>(g_QpcFreq.QuadPart));
     }
     sample->SetSampleTime(sampleTime);
-    sample->SetSampleDuration(10000000LL / g_TargetFps);
+    sample->SetSampleDuration(10000000LL / (s.fps ? s.fps : 30));
 
-    hr = g_pWriter->WriteSample(g_StreamIndex, sample);
+    hr = s.writer->WriteSample(s.streamIndex, sample);
     sample->Release();
     buffer->Release();
 
@@ -227,8 +309,42 @@ static bool EncodeFrameToSinkWriter(const QueuedFrame& frame)
         return false;
     }
 
+    ++s.framesWritten;
     g_RecordedFrames.fetch_add(1);
     return true;
+}
+
+// ── Queue helpers ────────────────────────────────────────────────────────────
+static void RecycleBufferLocked(std::vector<uint8_t>&& pixels)
+{
+    if (g_BufferPool.size() < MAX_QUEUE_FRAMES)
+    {
+        pixels.clear();
+        g_BufferPool.push_back(std::move(pixels));
+    }
+}
+
+static size_t QueuedFrameCountLocked()
+{
+    size_t n = 0;
+    for (const QueuedItem& i : g_Queue)
+        if (i.kind == ItemKind::Frame) ++n;
+    return n;
+}
+
+// Drop the oldest *frame* when the worker falls behind. Session markers are
+// never dropped: losing an EndSession would leave a recording unfinalised.
+static void DropOldestFrameLocked()
+{
+    for (auto it = g_Queue.begin(); it != g_Queue.end(); ++it)
+    {
+        if (it->kind == ItemKind::Frame)
+        {
+            RecycleBufferLocked(std::move(it->frame.pixels));
+            g_Queue.erase(it);
+            return;
+        }
+    }
 }
 
 // ── Background Worker Thread ─────────────────────────────────────────────────
@@ -237,64 +353,80 @@ static void RecorderWorkerLoop()
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     Log("[rec] Background encoding worker thread started");
 
-    while (g_WorkerRunning.load() || !g_FrameQueue.empty())
+    EncodeSession session;
+
+    for (;;)
     {
-        QueuedFrame frame;
+        QueuedItem item;
         {
             std::unique_lock<std::mutex> lock(g_QueueMtx);
             g_QueueCv.wait(lock, [] {
-                return !g_FrameQueue.empty() || !g_WorkerRunning.load();
+                return !g_Queue.empty() || !g_WorkerRunning.load();
             });
 
-            if (g_FrameQueue.empty())
+            if (g_Queue.empty())
+            {
+                if (!g_WorkerRunning.load()) break;  // stop only once drained
                 continue;
+            }
 
-            frame = std::move(g_FrameQueue.front());
-            g_FrameQueue.pop_front();
+            item = std::move(g_Queue.front());
+            g_Queue.pop_front();
         }
 
-        if (!g_pWriter)
+        switch (item.kind)
         {
-            if (!CreateSinkWriter(g_CurrentPath, frame.width, frame.height, g_TargetFps, g_BitrateKbps))
+        case ItemKind::BeginSession:
+            // Stop always queues an EndSession first, so this should be a no-op;
+            // close defensively so a sink writer can never be leaked.
+            CloseSession(session);
+            session = EncodeSession{};
+            strncpy_s(session.path, sizeof(session.path), item.path, _TRUNCATE);
+            session.fps         = item.fps;
+            session.bitrateKbps = item.bitrateKbps;
+            session.active      = true;
+            g_RecordedFrames.store(0);
+            break;
+
+        case ItemKind::Frame:
+            if (!session.active)
+                break;  // straggler from a session that has already ended
+
+            if (!session.writer &&
+                !OpenSession(session, item.frame.width, item.frame.height))
             {
                 Log("[rec] Failed to initialize SinkWriter in worker; stopping recorder");
+                session.active = false;
                 g_IsRecording.store(false);
                 break;
             }
+            EncodeFrame(session, item.frame);
+            break;
+
+        case ItemKind::EndSession:
+            CloseSession(session);
+            break;
         }
 
-        EncodeFrameToSinkWriter(frame);
-
+        if (item.kind == ItemKind::Frame)
         {
             std::lock_guard<std::mutex> lock(g_QueueMtx);
-            if (g_BufferPool.size() < MAX_QUEUE_FRAMES)
-            {
-                frame.pixels.clear();
-                g_BufferPool.push_back(std::move(frame.pixels));
-            }
+            RecycleBufferLocked(std::move(item.frame.pixels));
         }
     }
 
-    if (g_pWriter)
-    {
-        Log("[rec] Finalizing MP4 sink writer asynchronously...");
-        HRESULT hr = g_pWriter->Finalize();
-        if (FAILED(hr))
-            Log("[rec] Finalize failed: 0x%08lX", hr);
-        g_pWriter->Release();
-        g_pWriter = nullptr;
-        Log("[rec] Finalized successfully. Total recorded frames: %llu",
-            static_cast<unsigned long long>(g_RecordedFrames.load()));
-    }
+    CloseSession(session); // shutting down with a recording still open
 
     {
         std::lock_guard<std::mutex> lock(g_QueueMtx);
+        g_Queue.clear();
         g_BufferPool.clear();
         g_BufferPool.shrink_to_fit();
     }
 
     Log("[rec] Background encoding worker thread finished");
     CoUninitialize();
+    g_WorkerFinished.store(true);
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -305,36 +437,56 @@ void Recorder_Init()
     InitMediaFoundation();
     CreateDirectoryA("C:\\d3d9capture", nullptr);
     CreateDirectoryA(RECORDINGS_DIR, nullptr);
+
+    // One worker for the life of the recorder; Start/Stop only queue markers.
+    if (!g_WorkerRunning.exchange(true))
+    {
+        g_WorkerFinished.store(false);
+        std::thread(RecorderWorkerLoop).detach();
+    }
 }
 
 void Recorder_Shutdown()
 {
-    Recorder_Stop();
-    if (g_MfInitialized.load())
-    {
+    Recorder_Stop();               // queues EndSession if a recording is open
+
+    g_WorkerRunning.store(false);
+    g_QueueCv.notify_all();
+
+    // Bounded wait for the worker to finalise; never a join, so this is safe to
+    // call from a DLL teardown path where joining would risk the loader lock.
+    for (int i = 0; i < 500 && !g_WorkerFinished.load(); ++i)
+        Sleep(10);
+
+    if (g_MfInitialized.exchange(false))
         MFShutdown();
-        g_MfInitialized.store(false);
-    }
 }
 
 bool Recorder_Start(const char* customPath, uint32_t fps, uint32_t bitrateKbps)
 {
-    if (g_IsRecording.load() || g_WorkerRunning.load())
+    if (g_IsRecording.load())
     {
-        Log("[rec] Recorder is busy or active; ignoring Start");
+        Log("[rec] Already recording; ignoring Start");
+        return false;
+    }
+    if (!g_WorkerRunning.load())
+    {
+        Log("[rec] Recorder not initialised; ignoring Start");
         return false;
     }
 
     InitMediaFoundation();
 
-    g_TargetFps = (fps > 0) ? fps : 30;
-    g_BitrateKbps = (bitrateKbps > 0) ? bitrateKbps : 8000;
+    g_TargetFps.store(fps > 0 ? fps : 30);
+    g_BitrateKbps.store(bitrateKbps > 0 ? bitrateKbps : 8000);
     g_RecordedFrames.store(0);
-    g_BaseQpc = 0;
+    g_EncoderWidth.store(0);
+    g_EncoderHeight.store(0);
+    g_TotalPausedQpc.store(0);
     g_PauseStartQpc = 0;
-    g_TotalPausedQpc = 0;
     g_TotalPausedMs = 0;
-    g_LastError[0] = '\0';
+    g_PauseStartTick = 0;
+    SetRecorderError("");
 
     if (customPath && customPath[0] != '\0')
         strncpy_s(g_CurrentPath, sizeof(g_CurrentPath), customPath, _TRUNCATE);
@@ -344,18 +496,22 @@ bool Recorder_Start(const char* customPath, uint32_t fps, uint32_t bitrateKbps)
     QueryPerformanceCounter(&g_LastFrameQpc);
     g_RecordStartTick = GetTickCount();
 
-    if (g_WorkerThread.joinable())
+    QueuedItem begin;
+    begin.kind        = ItemKind::BeginSession;
+    begin.fps         = g_TargetFps.load();
+    begin.bitrateKbps = g_BitrateKbps.load();
+    strncpy_s(begin.path, sizeof(begin.path), g_CurrentPath, _TRUNCATE);
     {
-        g_WorkerThread.join();
+        std::lock_guard<std::mutex> lock(g_QueueMtx);
+        g_Queue.push_back(std::move(begin));
     }
-
-    g_WorkerRunning.store(true);
-    g_WorkerThread = std::thread(RecorderWorkerLoop);
+    g_QueueCv.notify_one();
 
     g_IsPaused.store(false);
     g_IsRecording.store(true);
 
-    Log("[rec] Recording started -> %s (%u FPS, %u kbps)", g_CurrentPath, g_TargetFps, g_BitrateKbps);
+    Log("[rec] Recording started -> %s (%u FPS, %u kbps)",
+        g_CurrentPath, g_TargetFps.load(), g_BitrateKbps.load());
     return true;
 }
 
@@ -378,33 +534,31 @@ void Recorder_Resume()
     uint64_t curQpc = static_cast<uint64_t>(now.QuadPart);
     if (curQpc >= g_PauseStartQpc)
     {
-        g_TotalPausedQpc += (curQpc - g_PauseStartQpc);
+        g_TotalPausedQpc.fetch_add(curQpc - g_PauseStartQpc);
     }
     g_TotalPausedMs += (GetTickCount() - g_PauseStartTick);
     g_IsPaused.store(false);
-    Log("[rec] Recording resumed (paused for %llu QPC ticks)", curQpc - g_PauseStartQpc);
+    Log("[rec] Recording resumed (paused for %llu QPC ticks)",
+        static_cast<unsigned long long>(curQpc - g_PauseStartQpc));
 }
 
 void Recorder_Stop()
 {
-    if (!g_IsRecording.load() && !g_WorkerRunning.load()) return;
+    if (!g_IsRecording.load()) return;
 
     Log("[rec] Stopping recording (async)...");
     g_IsRecording.store(false);
     g_IsPaused.store(false);
 
-    g_WorkerRunning.store(false);
-    g_QueueCv.notify_all();
-
-    if (g_WorkerThread.joinable())
+    QueuedItem end;
+    end.kind = ItemKind::EndSession;
     {
-        std::thread finisher([](std::thread t) {
-            if (t.joinable()) t.join();
-        }, std::move(g_WorkerThread));
-        finisher.detach();
+        std::lock_guard<std::mutex> lock(g_QueueMtx);
+        g_Queue.push_back(std::move(end));
     }
+    g_QueueCv.notify_one();
 
-    Log("[rec] Recording stop initiated without blocking render thread.");
+    Log("[rec] Recording stop queued; render thread not blocked.");
 }
 
 bool Recorder_IsRecording()
@@ -423,12 +577,15 @@ void Recorder_GetStats(RecorderStats* outStats)
     outStats->isRecording    = g_IsRecording.load();
     outStats->isPaused       = g_IsPaused.load();
     outStats->recordedFrames = g_RecordedFrames.load();
-    outStats->width          = g_EncoderWidth;
-    outStats->height         = g_EncoderHeight;
-    outStats->fps            = g_TargetFps;
-    outStats->bitrateKbps    = g_BitrateKbps;
+    outStats->width          = g_EncoderWidth.load();
+    outStats->height         = g_EncoderHeight.load();
+    outStats->fps            = g_TargetFps.load();
+    outStats->bitrateKbps    = g_BitrateKbps.load();
     strncpy_s(outStats->outputPath, sizeof(outStats->outputPath), g_CurrentPath, _TRUNCATE);
-    strncpy_s(outStats->lastError, sizeof(outStats->lastError), g_LastError, _TRUNCATE);
+    {
+        std::lock_guard<std::mutex> lock(g_ErrMtx);
+        strncpy_s(outStats->lastError, sizeof(outStats->lastError), g_LastError, _TRUNCATE);
+    }
 
     if (g_IsRecording.load())
     {
@@ -450,21 +607,23 @@ bool Recorder_WantsFrame()
 {
     if (!g_IsRecording.load() || g_IsPaused.load()) return false;
 
+    const uint32_t targetFps = g_TargetFps.load();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (g_QpcFreq.QuadPart > 0 && g_TargetFps > 0)
+    if (g_QpcFreq.QuadPart > 0 && targetFps > 0)
     {
         double elapsedSec = static_cast<double>(now.QuadPart - g_LastFrameQpc.QuadPart) / static_cast<double>(g_QpcFreq.QuadPart);
-        double minIntervalSec = 1.0 / static_cast<double>(g_TargetFps);
+        double minIntervalSec = 1.0 / static_cast<double>(targetFps);
         if (elapsedSec < (minIntervalSec * 0.88))
         {
-            return false;
+            return false; // Framerate limiter pacing
         }
     }
     return true;
 }
 
-void Recorder_OnFrameReady(const void* pixels, uint32_t width, uint32_t height, uint32_t stride, uint64_t frameIdx)
+void Recorder_OnFrameReady(const void* pixels, uint32_t width, uint32_t height,
+                           uint32_t stride, uint64_t frameIdx)
 {
     (void)frameIdx;
     if (!g_IsRecording.load() || g_IsPaused.load() || !pixels) return;
@@ -475,32 +634,36 @@ void Recorder_OnFrameReady(const void* pixels, uint32_t width, uint32_t height, 
 
     const size_t byteSize = static_cast<size_t>(width) * height * 4;
 
-    QueuedFrame frame;
-    frame.width  = width;
-    frame.height = height;
-    frame.stride = stride;
-    frame.qpc    = static_cast<uint64_t>(now.QuadPart);
+    QueuedItem item;
+    item.kind         = ItemKind::Frame;
+    item.frame.width  = width;
+    item.frame.height = height;
+    item.frame.stride = stride;
+    item.frame.qpc    = static_cast<uint64_t>(now.QuadPart);
 
     {
         std::unique_lock<std::mutex> lock(g_QueueMtx);
 
-        if (g_FrameQueue.size() >= MAX_QUEUE_FRAMES)
+        // Discard oldest frame if worker is overloaded to protect render thread
+        if (QueuedFrameCountLocked() >= MAX_QUEUE_FRAMES)
         {
-            g_FrameQueue.pop_front();
+            DropOldestFrameLocked();
         }
 
+        // Reuse memory from buffer pool
         if (!g_BufferPool.empty())
         {
-            frame.pixels = std::move(g_BufferPool.back());
+            item.frame.pixels = std::move(g_BufferPool.back());
             g_BufferPool.pop_back();
         }
     }
 
-    if (frame.pixels.size() < byteSize)
-        frame.pixels.resize(byteSize);
+    if (item.frame.pixels.size() < byteSize)
+        item.frame.pixels.resize(byteSize);
 
+    // Fast copy from render thread
     const BYTE* src = static_cast<const BYTE*>(pixels);
-    BYTE* dst = frame.pixels.data();
+    BYTE* dst = item.frame.pixels.data();
     const DWORD rowBytes = width * 4;
     for (uint32_t y = 0; y < height; ++y, src += stride, dst += rowBytes)
     {
@@ -509,7 +672,7 @@ void Recorder_OnFrameReady(const void* pixels, uint32_t width, uint32_t height, 
 
     {
         std::lock_guard<std::mutex> lock(g_QueueMtx);
-        g_FrameQueue.push_back(std::move(frame));
+        g_Queue.push_back(std::move(item));
     }
     g_QueueCv.notify_one();
 }
