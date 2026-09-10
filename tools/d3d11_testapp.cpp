@@ -50,6 +50,13 @@
 #include <cstdio>
 #include <cstdlib>
 
+// Deliberately file-scope. The DLL's fallback hook path scans a module's .data
+// section for a live swap chain pointer, so a stack local is invisible to it and
+// late injection would find nothing. Real games keep theirs in globals, which is
+// why that scan is what ends up hooking GTA V. Keeping a copy here lets
+// --wait-for exercise the same path.
+static IDXGISwapChain* g_SwapChainForScan = nullptr;
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
@@ -124,6 +131,7 @@ int main(int argc, char* argv[])
         printf("[testapp] D3D11CreateDeviceAndSwapChain failed hr=0x%08lX\n", hr);
         return 1;
     }
+    g_SwapChainForScan = sc;
     printf("[testapp] device=%p swapchain=%p featureLevel=0x%04X\n",
         (void*)dev, (void*)sc, (unsigned)fl);
     fflush(stdout);
