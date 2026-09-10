@@ -30,6 +30,7 @@
 
 #include "capture.h"
 #include "recorder.h"
+#include "audio.h"
 
 // ── tunables ──────────────────────────────────────────────────────────────────
 static constexpr int   DUMP_FRAMES       = 10;                  // 0 = disabled
@@ -193,6 +194,7 @@ void Capture_Init()
     Log("[con] Capture_Init");
     CreateDirectoryA(g_DumpDir, nullptr);
     InitSharedMemory();
+    Audio_Init();
     Recorder_Init();
     // capture.cpp has no init work; surfaces are created lazily on first Present.
 }
@@ -200,6 +202,7 @@ void Capture_Init()
 void Capture_Shutdown()
 {
     Recorder_Shutdown();
+    Audio_Shutdown();
     ShutdownSharedMemory();
     Capture_ReleaseSurfaces();  // free the D3D staging surfaces owned by capture.cpp
 }

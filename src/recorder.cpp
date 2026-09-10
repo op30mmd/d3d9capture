@@ -40,6 +40,7 @@
 
 #include "recorder.h"
 #include "capture.h"
+#include "audio.h"
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfreadwrite.lib")
@@ -47,7 +48,7 @@
 #pragma comment(lib, "ole32.lib")
 
 // ── Constants & Queue Configuration ──────────────────────────────────────────
-static constexpr size_t MAX_QUEUE_FRAMES = 24; // ~0.4s buffer at 60fps
+static constexpr size_t MAX_QUEUE_FRAMES = 128; // ~2.1s buffer at 60fps (absorbs I/O spikes and encoder init without drops)
 static constexpr char   RECORDINGS_DIR[] = "C:\\d3d9capture\\recordings\\";
 
 struct QueuedFrame
@@ -71,13 +72,18 @@ struct QueuedItem
     char        path[MAX_PATH] = "";    // ItemKind::BeginSession only
     uint32_t    fps = 30;               // ItemKind::BeginSession only
     uint32_t    bitrateKbps = 8000;     // ItemKind::BeginSession only
+    uint32_t    width = 0;              // ItemKind::BeginSession only
+    uint32_t    height = 0;             // ItemKind::BeginSession only
 };
 
 // ── State ────────────────────────────────────────────────────────────────────
 static std::atomic<bool>     g_MfInitialized{ false };
+static std::atomic<bool>     g_IsStarting{ false };
 static std::atomic<bool>     g_IsRecording{ false };
 static std::atomic<bool>     g_IsPaused{ false };
 static std::atomic<uint64_t> g_RecordedFrames{ 0 };
+static std::atomic<uint64_t> g_DroppedFrames{ 0 };
+static std::atomic<uint64_t> g_LastCaptureQpc{ 0 };
 
 // Published for the overlay's stats panel; written by whichever thread owns
 // the value, so they are atomic rather than plain scalars.
@@ -85,6 +91,19 @@ static std::atomic<uint32_t> g_TargetFps{ 30 };
 static std::atomic<uint32_t> g_BitrateKbps{ 8000 };
 static std::atomic<uint32_t> g_EncoderWidth{ 0 };
 static std::atomic<uint32_t> g_EncoderHeight{ 0 };
+static std::atomic<uint32_t> g_DefaultWidth{ 0 };
+static std::atomic<uint32_t> g_DefaultHeight{ 0 };
+static std::atomic<uint32_t> g_AudioBitrateKbps{ 192 };
+static std::atomic<bool>     g_HardwareTransforms{ true };
+
+void Recorder_SetDefaultResolution(uint32_t width, uint32_t height)
+{
+    if (width > 0 && height > 0)
+    {
+        g_DefaultWidth.store(width, std::memory_order_relaxed);
+        g_DefaultHeight.store(height, std::memory_order_relaxed);
+    }
+}
 
 static char                 g_CurrentPath[MAX_PATH] = ""; // render thread only
 
@@ -105,6 +124,11 @@ static std::deque<QueuedItem>            g_Queue;
 static std::vector<std::vector<uint8_t>> g_BufferPool; // Reusable allocations
 static std::atomic<bool>                 g_WorkerRunning{ false };
 
+static std::mutex                        g_SessionDoneMtx;
+static std::condition_variable           g_SessionDoneCv;
+static std::atomic<bool>                 g_SessionPendingOrActive{ false };
+static std::atomic<bool>                 g_AutoSaveOnExit{ true };
+
 // The worker is detached rather than held in a std::thread: this DLL is never
 // unloaded in the normal flow, so a std::thread member that is still joinable
 // when static destructors run would call std::terminate() and take the game
@@ -114,19 +138,24 @@ static std::atomic<bool>                 g_WorkerFinished{ true };
 // Everything the encoder touches, owned solely by the worker thread.
 struct EncodeSession
 {
-    IMFSinkWriter* writer      = nullptr;
-    DWORD          streamIndex = 0;
-    uint32_t       width       = 0;
-    uint32_t       height      = 0;
-    uint32_t       fps         = 30;
-    uint32_t       bitrateKbps = 8000;
-    uint64_t       baseQpc     = 0;
-    uint64_t       framesWritten = 0;   // this session only; the published
-                                        // g_RecordedFrames belongs to whichever
-                                        // session is currently active
-    bool           active      = false;
-    bool           warnedSizeMismatch = false;
-    char           path[MAX_PATH] = "";
+    IMFSinkWriter* writer              = nullptr;
+    DWORD          streamIndex         = 0;
+    DWORD          audioStreamIndex    = 0;
+    bool           hasAudioStream      = false;
+    uint32_t       audioSampleRate     = 48000;
+    LONGLONG       nextAudioSampleTime = 0;
+    uint64_t       audioFramesWritten  = 0;
+    uint32_t       width               = 0;
+    uint32_t       height              = 0;
+    uint32_t       fps                 = 30;
+    uint32_t       bitrateKbps         = 8000;
+    uint64_t       baseQpc             = 0;
+    uint64_t       framesWritten       = 0;   // this session only; the published
+                                              // g_RecordedFrames belongs to whichever
+                                              // session is currently active
+    bool           active              = false;
+    bool           warnedSizeMismatch  = false;
+    char           path[MAX_PATH]      = "";
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -178,7 +207,7 @@ static bool OpenSession(EncodeSession& s, uint32_t width, uint32_t height)
 
     IMFAttributes* attrs = nullptr;
     if (FAILED(MFCreateAttributes(&attrs, 2))) return false;
-    attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+    attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, g_HardwareTransforms.load() ? TRUE : FALSE);
     attrs->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
 
     HRESULT hr = MFCreateSinkWriterFromURL(wpath, nullptr, attrs, &s.writer);
@@ -226,6 +255,66 @@ static bool OpenSession(EncodeSession& s, uint32_t width, uint32_t height)
         return false;
     }
 
+    // ── Audio Stream (AAC) ──────────────────────────────────────────────────
+    s.hasAudioStream = false;
+    if (Audio_IsEnabled())
+    {
+        uint32_t aSampleRate = Audio_GetSampleRate();
+        if (aSampleRate == 0) aSampleRate = 48000;
+
+        uint32_t aBitrateKbps = g_AudioBitrateKbps.load();
+        if (aBitrateKbps < 64) aBitrateKbps = 192;
+        uint32_t aAvgBytes = (aBitrateKbps * 1000) / 8;
+
+        IMFMediaType* aOutType = nullptr;
+        if (SUCCEEDED(MFCreateMediaType(&aOutType)))
+        {
+            aOutType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            aOutType->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+            aOutType->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+            aOutType->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, aSampleRate);
+            aOutType->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+            aOutType->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, aAvgBytes);
+
+            hr = s.writer->AddStream(aOutType, &s.audioStreamIndex);
+            aOutType->Release();
+
+            if (SUCCEEDED(hr))
+            {
+                IMFMediaType* aInType = nullptr;
+                if (SUCCEEDED(MFCreateMediaType(&aInType)))
+                {
+                    aInType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+                    aInType->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+                    aInType->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+                    aInType->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, aSampleRate);
+                    aInType->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+                    aInType->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
+                    aInType->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, aSampleRate * 4);
+
+                    hr = s.writer->SetInputMediaType(s.audioStreamIndex, aInType, nullptr);
+                    aInType->Release();
+
+                    if (SUCCEEDED(hr))
+                    {
+                        s.hasAudioStream = true;
+                        s.audioSampleRate = aSampleRate;
+                        s.nextAudioSampleTime = 0;
+                        Log("[rec] AAC audio stream configured (%u Hz, stereo, 192 kbps)", aSampleRate);
+                    }
+                    else
+                    {
+                        Log("[rec] SetInputMediaType for audio failed: 0x%08lX", hr);
+                    }
+                }
+            }
+            else
+            {
+                Log("[rec] AddStream AAC failed: 0x%08lX (continuing video-only)", hr);
+            }
+        }
+    }
+
     hr = s.writer->BeginWriting();
     if (FAILED(hr))
     {
@@ -243,20 +332,192 @@ static bool OpenSession(EncodeSession& s, uint32_t width, uint32_t height)
     return true;
 }
 
+static bool WriteAudioFrames(EncodeSession& s, const int16_t* pcm, uint32_t numFrames)
+{
+    if (!s.writer || !s.hasAudioStream || numFrames == 0 || !pcm) return false;
+
+    while (numFrames > 0)
+    {
+        uint32_t chunkFrames = (numFrames > AUDIO_MAX_CHUNK_FRAMES) ? AUDIO_MAX_CHUNK_FRAMES : numFrames;
+        DWORD byteCount = chunkFrames * 2 * sizeof(int16_t);
+
+        IMFMediaBuffer* buffer = nullptr;
+        HRESULT hr = MFCreateMemoryBuffer(byteCount, &buffer);
+        if (FAILED(hr) || !buffer) return false;
+
+        BYTE* dst = nullptr;
+        if (FAILED(buffer->Lock(&dst, nullptr, nullptr)))
+        {
+            buffer->Release();
+            return false;
+        }
+
+        memcpy(dst, pcm, byteCount);
+        buffer->Unlock();
+        buffer->SetCurrentLength(byteCount);
+
+        IMFSample* sample = nullptr;
+        if (FAILED(MFCreateSample(&sample)))
+        {
+            buffer->Release();
+            return false;
+        }
+
+        LONGLONG sampleTime = s.nextAudioSampleTime;
+        LONGLONG duration = (static_cast<LONGLONG>(chunkFrames) * 10000000LL) / (s.audioSampleRate ? s.audioSampleRate : 48000);
+
+        sample->AddBuffer(buffer);
+        sample->SetSampleTime(sampleTime);
+        sample->SetSampleDuration(duration);
+
+        hr = s.writer->WriteSample(s.audioStreamIndex, sample);
+        sample->Release();
+        buffer->Release();
+
+        if (FAILED(hr)) return false;
+
+        s.audioFramesWritten += chunkFrames;
+        s.nextAudioSampleTime += duration;
+        pcm += chunkFrames * 2;
+        numFrames -= chunkFrames;
+    }
+    return true;
+}
+
+static bool WriteAudioSilence(EncodeSession& s, uint32_t numFrames)
+{
+    if (numFrames == 0) return true;
+    static const int16_t s_ZeroBuf[AUDIO_MAX_CHUNK_FRAMES * 2] = { 0 };
+
+    while (numFrames > 0)
+    {
+        uint32_t chunkFrames = (numFrames > AUDIO_MAX_CHUNK_FRAMES) ? AUDIO_MAX_CHUNK_FRAMES : numFrames;
+        if (!WriteAudioFrames(s, s_ZeroBuf, chunkFrames))
+            return false;
+        numFrames -= chunkFrames;
+    }
+    return true;
+}
+
+static bool EncodeAudioChunk(EncodeSession& s, const int16_t* pcm, uint32_t numFrames, uint64_t audioQpc)
+{
+    if (!s.writer || !s.hasAudioStream || numFrames == 0 || !pcm) return false;
+    if (s.baseQpc == 0) return false; // First video frame establishes baseline time
+
+    const uint64_t pausedQpc = g_TotalPausedQpc.load();
+    uint64_t frameQpc = (audioQpc >= pausedQpc) ? (audioQpc - pausedQpc) : 0;
+
+    int64_t targetHns = 0;
+    if (g_QpcFreq.QuadPart > 0)
+    {
+        if (frameQpc >= s.baseQpc)
+        {
+            targetHns = static_cast<int64_t>(((frameQpc - s.baseQpc) * 10000000ULL) / static_cast<uint64_t>(g_QpcFreq.QuadPart));
+        }
+        else
+        {
+            int64_t negHns = static_cast<int64_t>(((s.baseQpc - frameQpc) * 10000000ULL) / static_cast<uint64_t>(g_QpcFreq.QuadPart));
+            targetHns = -negHns;
+        }
+    }
+
+    // Initial audio alignment: ensure the very first audio packet is aligned to t=0
+    if (s.audioFramesWritten == 0)
+    {
+        if (targetHns < 0)
+        {
+            uint32_t trimFrames = static_cast<uint32_t>(((-targetHns) * s.audioSampleRate) / 10000000LL);
+            if (trimFrames >= numFrames) return true; // Entire chunk was before session start
+            pcm += trimFrames * 2;
+            numFrames -= trimFrames;
+            targetHns = 0;
+        }
+        else if (targetHns > 50000LL) // Arrived > 5ms after video started
+        {
+            uint32_t padFrames = static_cast<uint32_t>((targetHns * s.audioSampleRate) / 10000000LL);
+            if (padFrames > s.audioSampleRate) padFrames = s.audioSampleRate;
+            WriteAudioSilence(s, padFrames);
+        }
+    }
+
+    // Closed-loop drift correction:
+    // nextAudioSampleTime is the exact presentation timestamp of the next contiguous sample
+    int64_t writtenHns = s.nextAudioSampleTime;
+    int64_t driftHns = targetHns - writtenHns;
+    constexpr int64_t DRIFT_THRESHOLD_HNS = 250000LL; // 25ms tolerance window (< 1 video frame at 30/60fps)
+
+    if (driftHns > DRIFT_THRESHOLD_HNS)
+    {
+        // Audio underrun / gap detected (e.g. game stutter, scene loading).
+        // Bridge the gap with silence to maintain synchronization with video.
+        uint32_t gapFrames = static_cast<uint32_t>((driftHns * s.audioSampleRate) / 10000000LL);
+        if (gapFrames > s.audioSampleRate * 3) gapFrames = s.audioSampleRate * 3;
+        WriteAudioSilence(s, gapFrames);
+    }
+    else if (driftHns < -DRIFT_THRESHOLD_HNS)
+    {
+        // Audio overrun detected (audio running ahead of video clock by > 25ms).
+        // Drop excess frames to re-align.
+        uint32_t excessFrames = static_cast<uint32_t>(((-driftHns) * s.audioSampleRate) / 10000000LL);
+        if (excessFrames >= numFrames)
+        {
+            return true; // Entire chunk discarded to catch up with video clock
+        }
+        pcm += excessFrames * 2;
+        numFrames -= excessFrames;
+    }
+
+    return WriteAudioFrames(s, pcm, numFrames);
+}
+
+static void DrainAudio(EncodeSession& s)
+{
+    if (!s.writer || !s.hasAudioStream) return;
+
+    static thread_local int16_t s_PcmBuf[AUDIO_MAX_CHUNK_FRAMES * 2];
+    uint64_t audioQpc = 0;
+
+    while (uint32_t frames = Audio_ReadStereo16(s_PcmBuf, AUDIO_MAX_CHUNK_FRAMES, &audioQpc))
+    {
+        EncodeAudioChunk(s, s_PcmBuf, frames, audioQpc);
+    }
+}
+
 static void CloseSession(EncodeSession& s)
 {
     if (s.writer)
     {
+        DrainAudio(s);
+
+        // Pad trailing silence if audio track is shorter than video track
+        if (s.hasAudioStream && s.fps > 0 && s.audioSampleRate > 0 && s.framesWritten > 0)
+        {
+            int64_t videoDurHns = (static_cast<int64_t>(s.framesWritten) * 10000000LL) / s.fps;
+            int64_t audioDurHns = s.nextAudioSampleTime;
+            if (videoDurHns > audioDurHns)
+            {
+                int64_t trailingHns = videoDurHns - audioDurHns;
+                uint32_t padFrames = static_cast<uint32_t>((trailingHns * s.audioSampleRate) / 10000000LL);
+                if (padFrames > 0 && padFrames <= s.audioSampleRate * 3)
+                {
+                    WriteAudioSilence(s, padFrames);
+                }
+            }
+        }
+
         Log("[rec] Finalizing MP4 sink writer ...");
         HRESULT hr = s.writer->Finalize();
         if (FAILED(hr))
             SetRecorderError("Finalize failed: 0x%08lX", hr);
         s.writer->Release();
         s.writer = nullptr;
-        Log("[rec] Finalized. Total recorded frames: %llu -> %s",
-            static_cast<unsigned long long>(s.framesWritten), s.path);
+        Log("[rec] Finalized. Total recorded frames: %llu (audio frames: %llu) -> %s",
+            static_cast<unsigned long long>(s.framesWritten),
+            static_cast<unsigned long long>(s.audioFramesWritten), s.path);
     }
     s.active = false;
+    g_SessionPendingOrActive.store(false);
+    g_SessionDoneCv.notify_all();
 }
 
 static bool EncodeFrame(EncodeSession& s, const QueuedFrame& frame)
@@ -291,7 +552,14 @@ static bool EncodeFrame(EncodeSession& s, const QueuedFrame& frame)
         return false;
     }
 
-    MFCopyImage(dst, s.width * 4, frame.pixels.data(), frame.stride, s.width * 4, s.height);
+    if (frame.stride == s.width * 4)
+    {
+        memcpy(dst, frame.pixels.data(), frameBytes);
+    }
+    else
+    {
+        MFCopyImage(dst, s.width * 4, frame.pixels.data(), frame.stride, s.width * 4, s.height);
+    }
     buffer->Unlock();
     buffer->SetCurrentLength(frameBytes);
 
@@ -307,14 +575,54 @@ static bool EncodeFrame(EncodeSession& s, const QueuedFrame& frame)
     uint64_t frameQpc = (frame.qpc >= pausedQpc) ? (frame.qpc - pausedQpc) : 0;
     if (s.baseQpc == 0) s.baseQpc = frameQpc;
 
-    LONGLONG sampleTime = 0;
+    const LONGLONG frameDuration = 10000000LL / (s.fps ? s.fps : 30);
+    LONGLONG expectedSampleTime = static_cast<LONGLONG>(s.framesWritten) * frameDuration;
+
+    LONGLONG realTimeHns = 0;
     if (g_QpcFreq.QuadPart > 0 && frameQpc >= s.baseQpc)
     {
-        sampleTime = static_cast<LONGLONG>(
+        realTimeHns = static_cast<LONGLONG>(
             ((frameQpc - s.baseQpc) * 10000000ULL) / static_cast<uint64_t>(g_QpcFreq.QuadPart));
     }
+
+    // CFR (Constant Frame Rate) Pacing with Clock Drift Compensation:
+    // Paces video frames evenly to eliminate frame-time judder and micro-stutters.
+    // If the game has a momentary stutter / delay, fill small gaps (<= 8 frames)
+    // with duplicate samples to preserve continuous 60 FPS CFR stream without PTS judder.
+    LONGLONG driftHns = realTimeHns - expectedSampleTime;
+    LONGLONG sampleTime = expectedSampleTime;
+
+    if (driftHns > (frameDuration * 3LL / 2LL))
+    {
+        uint64_t targetFrameIdx = static_cast<uint64_t>(realTimeHns / frameDuration);
+        if (targetFrameIdx > s.framesWritten)
+        {
+            uint64_t gap = targetFrameIdx - s.framesWritten;
+            if (gap <= 8 && s.framesWritten > 0)
+            {
+                // Fill short gap with duplicate frames to maintain constant framerate and A/V sync
+                for (uint64_t i = 0; i < gap; ++i)
+                {
+                    LONGLONG gapSampleTime = static_cast<LONGLONG>(s.framesWritten) * frameDuration;
+                    sample->SetSampleTime(gapSampleTime);
+                    sample->SetSampleDuration(frameDuration);
+                    s.writer->WriteSample(s.streamIndex, sample);
+                    ++s.framesWritten;
+                    g_RecordedFrames.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            else
+            {
+                // Major freeze/level load: re-anchor timeline
+                s.framesWritten = targetFrameIdx;
+            }
+            expectedSampleTime = static_cast<LONGLONG>(s.framesWritten) * frameDuration;
+            sampleTime = expectedSampleTime;
+        }
+    }
+
     sample->SetSampleTime(sampleTime);
-    sample->SetSampleDuration(10000000LL / (s.fps ? s.fps : 30));
+    sample->SetSampleDuration(frameDuration);
 
     hr = s.writer->WriteSample(s.streamIndex, sample);
     sample->Release();
@@ -359,6 +667,7 @@ static void DropOldestFrameLocked()
         {
             RecycleBufferLocked(std::move(it->frame.pixels));
             g_Queue.erase(it);
+            g_DroppedFrames.fetch_add(1, std::memory_order_relaxed);
             return;
         }
     }
@@ -377,13 +686,27 @@ static void RecorderWorkerLoop()
         QueuedItem item;
         {
             std::unique_lock<std::mutex> lock(g_QueueMtx);
-            g_QueueCv.wait(lock, [] {
-                return !g_Queue.empty() || !g_WorkerRunning.load();
-            });
+            if (session.active)
+            {
+                g_QueueCv.wait_for(lock, std::chrono::milliseconds(10), [] {
+                    return !g_Queue.empty() || !g_WorkerRunning.load();
+                });
+            }
+            else
+            {
+                g_QueueCv.wait(lock, [] {
+                    return !g_Queue.empty() || !g_WorkerRunning.load();
+                });
+            }
 
             if (g_Queue.empty())
             {
                 if (!g_WorkerRunning.load()) break;  // stop only once drained
+                if (session.active && session.writer)
+                {
+                    lock.unlock();
+                    DrainAudio(session);
+                }
                 continue;
             }
 
@@ -402,25 +725,84 @@ static void RecorderWorkerLoop()
             session.fps         = item.fps;
             session.bitrateKbps = item.bitrateKbps;
             session.active      = true;
+            g_SessionPendingOrActive.store(true);
             g_RecordedFrames.store(0);
+
+            // Pre-initialize IMFSinkWriter if resolution is known upfront
+            // (eliminates queue backlog and init frame drops completely)
+            if (item.width > 0 && item.height > 0)
+            {
+                if (OpenSession(session, item.width, item.height))
+                {
+                    Audio_Flush();
+                    Audio_SetWanted(true);
+
+                    g_RecordedFrames.store(0);
+                    g_DroppedFrames.store(0);
+                    g_LastCaptureQpc.store(0);
+                    g_RecordStartTick = GetTickCount();
+                    g_TotalPausedMs = 0;
+
+                    g_IsStarting.store(false);
+                    g_IsRecording.store(true); // LIVE! Now render thread can start capturing!
+                    g_SessionDoneCv.notify_all();
+                    Log("[rec] Hardware encoder ready. Capture active with 0 init drops.");
+                }
+                else
+                {
+                    Log("[rec] Failed to open session in BeginSession; aborting recording");
+                    session.active = false;
+                    g_IsStarting.store(false);
+                    g_IsRecording.store(false);
+                    g_SessionPendingOrActive.store(false);
+                    g_SessionDoneCv.notify_all();
+                }
+            }
             break;
 
         case ItemKind::Frame:
             if (!session.active)
                 break;  // straggler from a session that has already ended
 
-            if (!session.writer &&
-                !OpenSession(session, item.frame.width, item.frame.height))
+            if (!session.writer)
             {
-                Log("[rec] Failed to initialize SinkWriter in worker; stopping recorder");
-                session.active = false;
-                g_IsRecording.store(false);
-                break;
+                if (!OpenSession(session, item.frame.width, item.frame.height))
+                {
+                    Log("[rec] Failed to initialize SinkWriter in worker; stopping recorder");
+                    session.active = false;
+                    g_IsStarting.store(false);
+                    g_IsRecording.store(false);
+                    g_SessionPendingOrActive.store(false);
+                    g_SessionDoneCv.notify_all();
+                    break;
+                }
+
+                // Clean-slate sync: Flush audio buffer and enable capture wanted flag NOW
+                Audio_Flush();
+                Audio_SetWanted(true);
+
+                g_RecordedFrames.store(0);
+                g_DroppedFrames.store(0);
+                g_LastCaptureQpc.store(0);
+                g_RecordStartTick = GetTickCount();
+                g_TotalPausedMs = 0;
+
+                const uint64_t pausedQpc = g_TotalPausedQpc.load();
+                session.baseQpc = (item.frame.qpc >= pausedQpc) ? (item.frame.qpc - pausedQpc) : 0;
+                session.nextAudioSampleTime = 0;
+                session.audioFramesWritten = 0;
+
+                g_IsStarting.store(false);
+                g_IsRecording.store(true);
+                g_SessionDoneCv.notify_all();
             }
             EncodeFrame(session, item.frame);
+            DrainAudio(session);
             break;
 
         case ItemKind::EndSession:
+            Audio_SetWanted(false);
+            DrainAudio(session);
             CloseSession(session);
             break;
         }
@@ -444,6 +826,8 @@ static void RecorderWorkerLoop()
     Log("[rec] Background encoding worker thread finished");
     CoUninitialize();
     g_WorkerFinished.store(true);
+    g_SessionPendingOrActive.store(false);
+    g_SessionDoneCv.notify_all();
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -465,25 +849,25 @@ void Recorder_Init()
 
 void Recorder_Shutdown()
 {
-    Recorder_Stop();               // queues EndSession if a recording is open
+    Recorder_StopSync(3000);
 
     g_WorkerRunning.store(false);
     g_QueueCv.notify_all();
 
     // Bounded wait for the worker to finalise; never a join, so this is safe to
     // call from a DLL teardown path where joining would risk the loader lock.
-    for (int i = 0; i < 500 && !g_WorkerFinished.load(); ++i)
+    for (int i = 0; i < 200 && !g_WorkerFinished.load(); ++i)
         Sleep(10);
 
     if (g_MfInitialized.exchange(false))
         MFShutdown();
 }
 
-bool Recorder_Start(const char* customPath, uint32_t fps, uint32_t bitrateKbps)
+bool Recorder_Start(const char* customPath, uint32_t fps, uint32_t bitrateKbps, uint32_t width, uint32_t height)
 {
-    if (g_IsRecording.load())
+    if (g_IsRecording.load() || g_IsStarting.load())
     {
-        Log("[rec] Already recording; ignoring Start");
+        Log("[rec] Already recording or starting; ignoring Start");
         return false;
     }
     if (!g_WorkerRunning.load())
@@ -494,11 +878,20 @@ bool Recorder_Start(const char* customPath, uint32_t fps, uint32_t bitrateKbps)
 
     InitMediaFoundation();
 
+    // Query active game resolution if not explicitly specified
+    if (width == 0 || height == 0)
+    {
+        width = g_DefaultWidth.load(std::memory_order_relaxed);
+        height = g_DefaultHeight.load(std::memory_order_relaxed);
+    }
+
     g_TargetFps.store(fps > 0 ? fps : 30);
     g_BitrateKbps.store(bitrateKbps > 0 ? bitrateKbps : 8000);
     g_RecordedFrames.store(0);
-    g_EncoderWidth.store(0);
-    g_EncoderHeight.store(0);
+    g_DroppedFrames.store(0);
+    g_LastCaptureQpc.store(0);
+    g_EncoderWidth.store(width);
+    g_EncoderHeight.store(height);
     g_TotalPausedQpc.store(0);
     g_PauseStartQpc = 0;
     g_TotalPausedMs = 0;
@@ -517,6 +910,8 @@ bool Recorder_Start(const char* customPath, uint32_t fps, uint32_t bitrateKbps)
     begin.kind        = ItemKind::BeginSession;
     begin.fps         = g_TargetFps.load();
     begin.bitrateKbps = g_BitrateKbps.load();
+    begin.width       = width;
+    begin.height      = height;
     strncpy_s(begin.path, sizeof(begin.path), g_CurrentPath, _TRUNCATE);
     {
         std::lock_guard<std::mutex> lock(g_QueueMtx);
@@ -525,11 +920,34 @@ bool Recorder_Start(const char* customPath, uint32_t fps, uint32_t bitrateKbps)
     g_QueueCv.notify_one();
 
     g_IsPaused.store(false);
-    g_IsRecording.store(true);
+    g_IsStarting.store(true);
+    // If width/height are known upfront, keep g_IsRecording false until OpenSession finishes
+    // so no frames flood the queue during MFT initialization.
+    // If width is 0 (synthetic offline test), set g_IsRecording true so first frame can be delivered.
+    g_IsRecording.store(width == 0 || height == 0);
+    g_SessionPendingOrActive.store(true);
 
-    Log("[rec] Recording started -> %s (%u FPS, %u kbps)",
-        g_CurrentPath, g_TargetFps.load(), g_BitrateKbps.load());
+    Log("[rec] Recording requested -> %s (%ux%u @ %u FPS, %u kbps, pre-init=%s)",
+        g_CurrentPath, width, height, g_TargetFps.load(), g_BitrateKbps.load(),
+        (width > 0 && height > 0) ? "yes" : "deferred");
     return true;
+}
+
+bool Recorder_WaitForReady(uint32_t timeoutMs)
+{
+    if (g_IsRecording.load()) return true;
+    if (!g_IsStarting.load()) return false;
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    std::unique_lock<std::mutex> lock(g_SessionDoneMtx);
+    return g_SessionDoneCv.wait_until(lock, deadline, [] {
+        return g_IsRecording.load() || !g_IsStarting.load() || !g_WorkerRunning.load();
+    }) && g_IsRecording.load();
+}
+
+bool Recorder_IsStarting()
+{
+    return g_IsStarting.load();
 }
 
 void Recorder_Pause()
@@ -540,6 +958,7 @@ void Recorder_Pause()
     g_PauseStartQpc = static_cast<uint64_t>(now.QuadPart);
     g_PauseStartTick = GetTickCount();
     g_IsPaused.store(true);
+    Audio_SetWanted(false);
     Log("[rec] Recording paused");
 }
 
@@ -554,6 +973,7 @@ void Recorder_Resume()
         g_TotalPausedQpc.fetch_add(curQpc - g_PauseStartQpc);
     }
     g_TotalPausedMs += (GetTickCount() - g_PauseStartTick);
+    Audio_SetWanted(true);
     g_IsPaused.store(false);
     Log("[rec] Recording resumed (paused for %llu QPC ticks)",
         static_cast<unsigned long long>(curQpc - g_PauseStartQpc));
@@ -561,11 +981,13 @@ void Recorder_Resume()
 
 void Recorder_Stop()
 {
-    if (!g_IsRecording.load()) return;
+    if (!g_IsRecording.load() && !g_IsStarting.load()) return;
 
     Log("[rec] Stopping recording (async)...");
+    g_IsStarting.store(false);
     g_IsRecording.store(false);
     g_IsPaused.store(false);
+    Audio_SetWanted(false);
 
     QueuedItem end;
     end.kind = ItemKind::EndSession;
@@ -576,6 +998,81 @@ void Recorder_Stop()
     g_QueueCv.notify_one();
 
     Log("[rec] Recording stop queued; render thread not blocked.");
+}
+
+bool Recorder_StopSync(uint32_t timeoutMs)
+{
+    static std::mutex s_StopSyncMtx;
+    std::lock_guard<std::mutex> syncLock(s_StopSyncMtx);
+
+    if (!g_IsRecording.load() && !g_IsStarting.load() && !g_SessionPendingOrActive.load())
+    {
+        return true;
+    }
+
+    Log("[rec] Recorder_StopSync called (timeout=%u ms)...", timeoutMs);
+
+    // Stop accepting new frames & audio immediately
+    g_IsStarting.store(false);
+    g_IsRecording.store(false);
+    g_IsPaused.store(false);
+    Audio_SetWanted(false);
+
+    // If worker is not running or already finished, nothing to wait for
+    if (!g_WorkerRunning.load() || g_WorkerFinished.load())
+    {
+        g_SessionPendingOrActive.store(false);
+        return true;
+    }
+
+    // Ensure EndSession marker is in the queue
+    {
+        std::lock_guard<std::mutex> lock(g_QueueMtx);
+        bool hasEndSession = false;
+        for (const auto& item : g_Queue)
+        {
+            if (item.kind == ItemKind::EndSession)
+            {
+                hasEndSession = true;
+                break;
+            }
+        }
+        if (!hasEndSession)
+        {
+            QueuedItem end;
+            end.kind = ItemKind::EndSession;
+            g_Queue.push_back(std::move(end));
+        }
+    }
+    g_QueueCv.notify_all();
+
+    // Block until the worker thread has closed the session or finished or timeout
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    std::unique_lock<std::mutex> lock(g_SessionDoneMtx);
+    bool done = g_SessionDoneCv.wait_until(lock, deadline, [] {
+        return !g_SessionPendingOrActive.load() || g_WorkerFinished.load();
+    });
+
+    if (done)
+    {
+        Log("[rec] Recorder_StopSync: MP4 recording successfully saved and finalized.");
+        return true;
+    }
+    else
+    {
+        Log("[rec] Recorder_StopSync: Timed out waiting for MP4 finalization (%u ms).", timeoutMs);
+        return false;
+    }
+}
+
+void Recorder_SetAutoSaveOnExit(bool enable)
+{
+    g_AutoSaveOnExit.store(enable);
+}
+
+bool Recorder_GetAutoSaveOnExit()
+{
+    return g_AutoSaveOnExit.load();
 }
 
 bool Recorder_IsRecording()
@@ -592,8 +1089,10 @@ void Recorder_GetStats(RecorderStats* outStats)
 {
     if (!outStats) return;
     outStats->isRecording    = g_IsRecording.load();
+    outStats->isStarting     = g_IsStarting.load();
     outStats->isPaused       = g_IsPaused.load();
     outStats->recordedFrames = g_RecordedFrames.load();
+    outStats->droppedFrames  = g_DroppedFrames.load(std::memory_order_relaxed);
     outStats->width          = g_EncoderWidth.load();
     outStats->height         = g_EncoderHeight.load();
     outStats->fps            = g_TargetFps.load();
@@ -625,17 +1124,29 @@ bool Recorder_WantsFrame()
     if (!g_IsRecording.load() || g_IsPaused.load()) return false;
 
     const uint32_t targetFps = g_TargetFps.load();
+    if (targetFps == 0) return true;
+
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (g_QpcFreq.QuadPart > 0 && targetFps > 0)
+    if (g_QpcFreq.QuadPart > 0)
     {
-        double elapsedSec = static_cast<double>(now.QuadPart - g_LastFrameQpc.QuadPart) / static_cast<double>(g_QpcFreq.QuadPart);
-        double minIntervalSec = 1.0 / static_cast<double>(targetFps);
-        if (elapsedSec < (minIntervalSec * 0.88))
+        uint64_t lastQpc = g_LastCaptureQpc.load(std::memory_order_relaxed);
+        if (lastQpc != 0)
         {
-            return false; // Framerate limiter pacing
+            uint64_t intervalTicks = static_cast<uint64_t>(g_QpcFreq.QuadPart) / targetFps;
+            // 70% threshold: prevents VSync/DWM jitter (+/- 15%) from dropping frames
+            // when game FPS == target FPS, while cleanly decimating higher framerates
+            // (e.g. 120 FPS -> 60 FPS, 60 FPS -> 30 FPS).
+            uint64_t minTicks = (intervalTicks * 70ULL) / 100ULL;
+            uint64_t elapsedTicks = static_cast<uint64_t>(now.QuadPart) - lastQpc;
+            if (elapsedTicks < minTicks)
+            {
+                return false;
+            }
         }
     }
+
+    g_LastCaptureQpc.store(static_cast<uint64_t>(now.QuadPart), std::memory_order_relaxed);
     return true;
 }
 
@@ -688,9 +1199,16 @@ void Recorder_OnFrameReady(const void* pixels, uint32_t width, uint32_t height,
     const BYTE* src = static_cast<const BYTE*>(pixels);
     BYTE* dst = item.frame.pixels.data();
     const DWORD rowBytes = width * 4;
-    for (uint32_t y = 0; y < height; ++y, src += stride, dst += rowBytes)
+    if (stride == rowBytes)
     {
-        memcpy(dst, src, rowBytes);
+        memcpy(dst, src, byteSize);
+    }
+    else
+    {
+        for (uint32_t y = 0; y < height; ++y, src += stride, dst += rowBytes)
+        {
+            memcpy(dst, src, rowBytes);
+        }
     }
 
     {
@@ -699,3 +1217,24 @@ void Recorder_OnFrameReady(const void* pixels, uint32_t width, uint32_t height,
     }
     g_QueueCv.notify_one();
 }
+
+void Recorder_SetAudioBitrate(uint32_t kbps)
+{
+    g_AudioBitrateKbps.store(kbps > 0 ? kbps : 192);
+}
+
+uint32_t Recorder_GetAudioBitrate()
+{
+    return g_AudioBitrateKbps.load();
+}
+
+void Recorder_SetHardwareAccel(bool enable)
+{
+    g_HardwareTransforms.store(enable);
+}
+
+bool Recorder_GetHardwareAccel()
+{
+    return g_HardwareTransforms.load();
+}
+

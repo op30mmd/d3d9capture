@@ -77,10 +77,11 @@ consumer -- not the render thread -- sets the capture rate.
 | File | Purpose |
 |---|---|
 | `dllmain.cpp` | DLL entry point; patches D3D9 factory, D3D11 device, and DXGI swap chain imports (`Present` / `Reset` / `ResizeBuffers`), plus the fallback scan for an existing device / swap chain |
-| `capture.h/cpp` | Double-buffered GPU readback via `GetRenderTargetData` (D3D9) and `CopyResource` (D3D11/DXGI) |
+| `capture.h/cpp` | Double-buffered GPU readback via `GetRenderTargetData` (D3D9) and `CopyResource` (D3D11/DXGI); calls `Recorder_SetDefaultResolution` on every present so the encoder always knows the active resolution before recording starts |
 | `consumer_backend.cpp` | Writes frames to named shared memory; screenshots and BMP debug dumps |
-| `overlay.h/cpp` | In-game ImGui control centre drawn inside the `Present` hook (D3D9 & D3D11 backends) |
-| `recorder.h/cpp` | In-process H.264/MP4 encoder: one long-lived worker draining a bounded queue of frames and session markers into a Media Foundation `IMFSinkWriter` |
+| `audio.h/cpp` | In-process WASAPI audio capture: hooks `IAudioRenderClient::ReleaseBuffer` to intercept the game's own render buffer PCM before the audio engine consumes it; includes a desktop-loopback fallback, software volume control, QPC-stamped ring delivery, and an auto-switch between hook and loopback modes |
+| `overlay.h/cpp` | In-game ImGui control centre drawn inside the `Present` hook (D3D9 & D3D11 backends); shows a tri-state recording beacon (amber while initialising, solid red when live), an audio dashboard, and per-stream stats |
+| `recorder.h/cpp` | In-process H.264/MP4 encoder: one long-lived worker draining a bounded queue of frames and session markers into a Media Foundation `IMFSinkWriter`; pre-arms the sink writer before the first frame is queued so recording starts with zero dropped frames |
 | `imgui_impl_dx9_patched.cpp` | Local fork of ImGui's DX9 backend compiled **instead of** the submodule's copy |
 | `inject_tool.cpp` | `CreateRemoteThread` injector; accepts a PID, a process name, `--launch`, or `--wait-for` (attach once a Direct3D runtime is loaded) |
 | `shm_reader.cpp` | Out-of-process frame consumer; records H.264 MP4 via Media Foundation |
@@ -186,6 +187,28 @@ same `Present` hook that captures frames.
 | `Insert` | Show / hide the control centre |
 | `F9` | Start / stop recording, menu open or closed |
 
+The recording beacon in the mini-HUD is tri-state:
+
+| Colour | Meaning |
+|---|---|
+| **Amber (pulsing)** | `[STARTING]` — sink writer is pre-arming; no frames are captured yet |
+| **Red (solid)** | `[REC]` — recording is live |
+| **Off** | Idle |
+
+The control centre also exposes an **Audio** tab with live stats (source, peak
+dBFS, ring fill %, captured/dropped frames), a software **gain** slider
+(0–300 %), and a **capture mode** selector:
+
+| Mode | Description |
+|---|---|
+| **Auto** | Prefers the in-process WASAPI hook; silently falls back to desktop loopback if the hook finds no audio |
+| **Direct hook** | Forces the in-process WASAPI hook only |
+| **Loopback** | Forces desktop/system loopback capture |
+
+**Auto-save on exit** — when enabled, an active recording is stopped and
+finalised automatically if the game exits or crashes, so the MP4 is always
+written out cleanly.
+
 ---
 
 ## How the Capture Works
@@ -261,6 +284,51 @@ All sink-writer state lives in a worker-local `EncodeSession`, so nothing the
 encoder touches is a shared global. When the queue is full the **oldest frame**
 is dropped; session markers are never dropped, since losing an `EndSession`
 would leave a recording unfinalised.
+
+#### 3a. Zero-drop recording start (async pre-arm)
+
+Opening an `IMFSinkWriter` — negotiating the hardware H.264/AAC MFT, calling
+`BeginWriting` — takes **1.75 to 1.95 seconds** measured on typical hardware.
+Queuing frames during that window filled the ring (128 entries) and triggered
+`DropOldestFrameLocked`, discarding 45–85 frames before encoding even began,
+visible as a stutter at the very start of every recording.
+
+The fix: `Recorder_Start` sets `g_IsStarting = true` and keeps `g_IsRecording =
+false`. The render thread does **not** queue frames while `isStarting` is set.
+On the worker thread, `BeginSession` calls `OpenSession` synchronously (the
+~1.8 s wait happens on the worker, not the render thread), then:
+
+1. Flushes any stale audio from the ring.
+2. Enables audio capture (`Audio_SetWanted(true)`).
+3. Zeros frame counters so the first captured frame has `t = 0.000 s`.
+4. Atomically sets `g_IsStarting = false` and `g_IsRecording = true`.
+5. Notifies any `Recorder_WaitForReady` callers.
+
+Result: Frame 0 and Audio sample 0 are both stamped at exactly `t = 0`, with no
+queue backlog and 0 dropped frames at start.
+
+#### 3b. In-process audio capture
+
+Audio is captured by `audio.h/cpp`. The WASAPI hook intercepts
+`IAudioRenderClient::ReleaseBuffer` in the game's own audio thread and copies
+PCM directly into a lock-free single-producer/single-consumer ring. The encoder
+worker drains this ring between video frames, converts to interleaved 16-bit
+stereo, and writes AAC samples to the sink writer with QPC-derived timestamps
+that align exactly with video.
+
+If the direct hook finds no audio within a configurable timeout, a desktop
+loopback fallback thread engages automatically (configurable via the overlay's
+Audio tab or `Audio_SetCaptureMode`).
+
+A software gain stage (default 1.0×, range 0–3.0×) is applied at the ring
+drain, so volume can be adjusted without touching WASAPI mixer levels.
+
+#### 3c. Auto-save on exit
+
+When `Recorder_SetAutoSaveOnExit(true)` is set, the game's `ExitProcess` /
+`TerminateProcess` imports are patched. On interception, a final
+`Recorder_StopSync` is called with a 5-second timeout so the sink writer is
+always finalised, even if the game exits abruptly.
 
 ---
 

@@ -22,10 +22,10 @@ echo.
 echo [1/3] Building d3d9capture.dll ...
 cl /nologo /W3 /O2 /MD /LD /I imgui /I imgui\backends ^
    /Fe:%OUTDIR%\d3d9capture.dll ^
-   dllmain.cpp capture.cpp consumer_backend.cpp recorder.cpp overlay.cpp ^
+   dllmain.cpp capture.cpp consumer_backend.cpp recorder.cpp overlay.cpp audio.cpp ^
    imgui\imgui.cpp imgui\imgui_draw.cpp imgui\imgui_widgets.cpp imgui\imgui_tables.cpp imgui\imgui_demo.cpp ^
    imgui\backends\imgui_impl_win32.cpp imgui\backends\imgui_impl_dx11.cpp imgui_impl_dx9_patched.cpp ^
-   /link d3d9.lib d3d11.lib dxgi.lib d3dcompiler.lib dwmapi.lib user32.lib gdi32.lib dxguid.lib shell32.lib mfplat.lib mfuuid.lib mfreadwrite.lib ole32.lib
+   /link d3d9.lib d3d11.lib dxgi.lib d3dcompiler.lib dwmapi.lib user32.lib gdi32.lib dxguid.lib shell32.lib mfplat.lib mfuuid.lib mfreadwrite.lib ole32.lib psapi.lib
 if errorlevel 1 goto fail
 
 echo.

@@ -31,12 +31,19 @@
 
 #include "capture.h"
 #include "overlay.h"
+#include "recorder.h"
 
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
 
 // ── logging ──────────────────────────────────────────────────────────────────
+static constexpr size_t MAX_LOG_RING = 512;
+static LogEntry s_LogRing[MAX_LOG_RING];
+static size_t   s_LogHead = 0;
+static size_t   s_LogTotal = 0;
+static std::mutex s_LogMtx;
+
 void Log(const char* fmt, ...)
 {
     char message[1024];
@@ -55,6 +62,13 @@ void Log(const char* fmt, ...)
     OutputDebugStringA(line);
     OutputDebugStringA("\n");
 
+    {
+        std::lock_guard<std::mutex> lk(s_LogMtx);
+        strncpy_s(s_LogRing[s_LogHead].text, sizeof(s_LogRing[s_LogHead].text), line, _TRUNCATE);
+        s_LogHead = (s_LogHead + 1) % MAX_LOG_RING;
+        s_LogTotal++;
+    }
+
     CreateDirectoryA("C:\\d3d9capture", nullptr);
     FILE* f = nullptr;
     if (fopen_s(&f, "C:\\d3d9capture\\debug.log", "a") == 0 && f)
@@ -62,6 +76,38 @@ void Log(const char* fmt, ...)
         fprintf(f, "%s\n", line);
         fclose(f);
     }
+}
+
+size_t Log_GetRecentEntries(LogEntry* outEntries, size_t maxCount)
+{
+    if (!outEntries || maxCount == 0) return 0;
+    std::lock_guard<std::mutex> lk(s_LogMtx);
+    size_t count = (s_LogTotal < MAX_LOG_RING) ? s_LogTotal : MAX_LOG_RING;
+    if (count > maxCount) count = maxCount;
+    size_t start = (s_LogHead + MAX_LOG_RING - count) % MAX_LOG_RING;
+    for (size_t i = 0; i < count; ++i)
+    {
+        outEntries[i] = s_LogRing[(start + i) % MAX_LOG_RING];
+    }
+    return count;
+}
+
+void Log_ClearRecentEntries()
+{
+    std::lock_guard<std::mutex> lk(s_LogMtx);
+    s_LogHead = 0;
+    s_LogTotal = 0;
+}
+
+void Log_ClearLogFile()
+{
+    Log_ClearRecentEntries();
+    FILE* f = nullptr;
+    if (fopen_s(&f, "C:\\d3d9capture\\debug.log", "w") == 0 && f)
+    {
+        fclose(f);
+    }
+    Log("[app] debug.log cleared");
 }
 
 // ── vtable slot indices ───────────────────────────────────────────────────────
@@ -185,6 +231,192 @@ static bool HookSlot(void** vtbl, int slot, void* replacement, void** original)
 {
     *original = vtbl[slot];
     return PatchVTable(&vtbl[slot], replacement, original);
+}
+
+// ── Process Exit Interception (Auto-save in-progress recordings) ─────────────
+typedef void (WINAPI *ExitProcess_t)(UINT uExitCode);
+typedef BOOL (WINAPI *TerminateProcess_t)(HANDLE hProcess, UINT uExitCode);
+typedef void (NTAPI *RtlExitUserProcess_t)(LONG Status);
+
+static ExitProcess_t        g_OrigExitProcess = nullptr;
+static TerminateProcess_t   g_OrigTerminateProcess = nullptr;
+static RtlExitUserProcess_t g_pfnRtlExitUserProcess = nullptr;
+
+struct InlineHook
+{
+    void* target = nullptr;
+    unsigned char origBytes[16] = {};
+    size_t patchSize = 0;
+    bool installed = false;
+};
+
+static InlineHook g_ExitProcessK32Hook;
+static InlineHook g_ExitProcessKBaseHook;
+static InlineHook g_TerminateProcessK32Hook;
+
+static bool InstallInlineHook(void* targetFunc, void* hookFunc, InlineHook& hook)
+{
+    if (!targetFunc || !hookFunc) return false;
+    hook.target = targetFunc;
+
+#ifdef _M_X64
+    hook.patchSize = 14;
+    unsigned char patch[14] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
+    memcpy(patch + 6, &hookFunc, sizeof(void*));
+#else
+    hook.patchSize = 5;
+    unsigned char patch[5] = { 0xE9 };
+    uintptr_t rel = reinterpret_cast<uintptr_t>(hookFunc) - (reinterpret_cast<uintptr_t>(targetFunc) + 5);
+    memcpy(patch + 1, &rel, sizeof(uint32_t));
+#endif
+
+    DWORD oldProt = 0;
+    if (!VirtualProtect(targetFunc, hook.patchSize, PAGE_EXECUTE_READWRITE, &oldProt))
+        return false;
+
+    memcpy(hook.origBytes, targetFunc, hook.patchSize);
+    memcpy(targetFunc, patch, hook.patchSize);
+
+    DWORD ignored = 0;
+    VirtualProtect(targetFunc, hook.patchSize, oldProt, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), targetFunc, hook.patchSize);
+    hook.installed = true;
+    return true;
+}
+
+static void RestoreInlineHook(InlineHook& hook)
+{
+    if (!hook.installed || !hook.target || hook.patchSize == 0) return;
+    DWORD oldProt = 0, ignored = 0;
+    if (VirtualProtect(hook.target, hook.patchSize, PAGE_EXECUTE_READWRITE, &oldProt))
+    {
+        memcpy(hook.target, hook.origBytes, hook.patchSize);
+        VirtualProtect(hook.target, hook.patchSize, oldProt, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), hook.target, hook.patchSize);
+        hook.installed = false;
+    }
+}
+
+static std::mutex        g_ExitMtx;
+static std::atomic<bool> g_ExitCompleted{ false };
+
+static void PerformGracefulShutdown(const char* trigger)
+{
+    std::lock_guard<std::mutex> lk(g_ExitMtx);
+    if (g_ExitCompleted.load())
+        return;
+
+    Log("[exit] Graceful shutdown initiated by %s", trigger);
+
+    if (Recorder_GetAutoSaveOnExit() && Recorder_IsRecording())
+    {
+        Log("[exit] In-progress recording active; saving MP4 synchronously before process terminates...");
+        Recorder_StopSync(5000);
+    }
+
+    Capture_Shutdown();
+    Overlay_Shutdown();
+
+    g_ExitCompleted.store(true);
+    Log("[exit] Graceful shutdown finished for %s", trigger);
+}
+
+static void WINAPI Hooked_ExitProcess(UINT uExitCode)
+{
+    PerformGracefulShutdown("ExitProcess");
+
+    RestoreInlineHook(g_ExitProcessK32Hook);
+    RestoreInlineHook(g_ExitProcessKBaseHook);
+    RestoreInlineHook(g_TerminateProcessK32Hook);
+
+    if (g_pfnRtlExitUserProcess)
+    {
+        g_pfnRtlExitUserProcess(static_cast<LONG>(uExitCode));
+    }
+    if (g_OrigExitProcess)
+    {
+        g_OrigExitProcess(uExitCode);
+    }
+    ExitProcess(uExitCode);
+}
+
+static BOOL WINAPI Hooked_TerminateProcess(HANDLE hProcess, UINT uExitCode)
+{
+    bool isCurrent = false;
+    if (hProcess == GetCurrentProcess())
+    {
+        isCurrent = true;
+    }
+    else
+    {
+        DWORD pid = GetProcessId(hProcess);
+        if (pid == 0 || pid == GetCurrentProcessId())
+            isCurrent = true;
+    }
+
+    if (isCurrent)
+    {
+        PerformGracefulShutdown("TerminateProcess");
+        RestoreInlineHook(g_ExitProcessK32Hook);
+        RestoreInlineHook(g_ExitProcessKBaseHook);
+        RestoreInlineHook(g_TerminateProcessK32Hook);
+        if (g_pfnRtlExitUserProcess)
+        {
+            g_pfnRtlExitUserProcess(static_cast<LONG>(uExitCode));
+        }
+    }
+
+    if (g_OrigTerminateProcess)
+    {
+        return g_OrigTerminateProcess(hProcess, uExitCode);
+    }
+    return TerminateProcess(hProcess, uExitCode);
+}
+
+static void OnProcessExit()
+{
+    PerformGracefulShutdown("atexit");
+}
+
+static void InstallProcessExitHooks()
+{
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (hNtdll)
+    {
+        g_pfnRtlExitUserProcess = reinterpret_cast<RtlExitUserProcess_t>(
+            GetProcAddress(hNtdll, "RtlExitUserProcess"));
+    }
+
+    HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+    if (hK32)
+    {
+        void* pExit = reinterpret_cast<void*>(GetProcAddress(hK32, "ExitProcess"));
+        if (pExit)
+        {
+            if (InstallInlineHook(pExit, reinterpret_cast<void*>(Hooked_ExitProcess), g_ExitProcessK32Hook))
+                Log("[exit] Inline hook installed on kernel32!ExitProcess");
+        }
+
+        void* pTerm = reinterpret_cast<void*>(GetProcAddress(hK32, "TerminateProcess"));
+        if (pTerm)
+        {
+            if (InstallInlineHook(pTerm, reinterpret_cast<void*>(Hooked_TerminateProcess), g_TerminateProcessK32Hook))
+                Log("[exit] Inline hook installed on kernel32!TerminateProcess");
+        }
+    }
+
+    HMODULE hKBase = GetModuleHandleA("kernelbase.dll");
+    if (hKBase)
+    {
+        void* pExit = reinterpret_cast<void*>(GetProcAddress(hKBase, "ExitProcess"));
+        if (pExit)
+        {
+            if (InstallInlineHook(pExit, reinterpret_cast<void*>(Hooked_ExitProcess), g_ExitProcessKBaseHook))
+                Log("[exit] Inline hook installed on kernelbase!ExitProcess");
+        }
+    }
+
+    atexit(OnProcessExit);
 }
 
 static void HookSwapChainPresent(IDirect3DDevice9* pDev);
@@ -991,7 +1223,10 @@ static void PatchModuleImports(HMODULE module)
         const bool isD3D11 = IsD3D11Import(descName);
         const bool isDXGI = IsDXGIImport(descName);
         const bool isDInput8 = IsDInput8Import(descName);
-        if (!isD3D9 && !isD3D11 && !isDXGI && !isDInput8) continue;
+        const bool isKernel = (_strnicmp(descName, "kernel32", 8) == 0) ||
+                             (_strnicmp(descName, "kernelbase", 10) == 0) ||
+                             (_strnicmp(descName, "api-ms-win-core-processthreads", 30) == 0);
+        if (!isD3D9 && !isD3D11 && !isDXGI && !isDInput8 && !isKernel) continue;
 
         if (isD3D9 || isD3D11 || isDXGI) g_FactoryImportsSeen.fetch_add(1);
 
@@ -1054,6 +1289,19 @@ static void PatchModuleImports(HMODULE module)
                 {
                     replacement = reinterpret_cast<void*>(Hooked_DirectInput8Create);
                     original = reinterpret_cast<void**>(&g_OrigDirectInput8Create);
+                }
+            }
+            else if (isKernel)
+            {
+                if (strcmp(reinterpret_cast<const char*>(import->Name), "ExitProcess") == 0)
+                {
+                    replacement = reinterpret_cast<void*>(Hooked_ExitProcess);
+                    original = reinterpret_cast<void**>(&g_OrigExitProcess);
+                }
+                else if (strcmp(reinterpret_cast<const char*>(import->Name), "TerminateProcess") == 0)
+                {
+                    replacement = reinterpret_cast<void*>(Hooked_TerminateProcess);
+                    original = reinterpret_cast<void**>(&g_OrigTerminateProcess);
                 }
             }
             if (replacement)
@@ -1389,6 +1637,24 @@ static void HookDirect3DFactory()
     Log("[hook] Scanning executable import table: %s (%p)", executablePath, executable);
     PatchModuleImports(executable);
 
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snapshot != INVALID_HANDLE_VALUE)
+    {
+        MODULEENTRY32 entry = {};
+        entry.dwSize = sizeof(entry);
+        if (Module32First(snapshot, &entry))
+        {
+            do
+            {
+                if (entry.hModule != executable && entry.hModule != g_ThisModule)
+                {
+                    PatchModuleImports(entry.hModule);
+                }
+            } while (Module32Next(snapshot, &entry));
+        }
+        CloseHandle(snapshot);
+    }
+
     const unsigned long seen = g_FactoryImportsSeen.load();
     const unsigned long patched = g_FactoryImportsPatched.load();
     Log("[hook] Factory import scan complete: render import descriptors=%lu patched slots=%lu", seen, patched);
@@ -1416,6 +1682,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     Log("[dll] WorkerThread started (loader lock delay complete)");
     Capture_Init();
+    InstallProcessExitHooks();
 
     SignalInjectorReady();
     HookDirect3DFactory();
@@ -1435,10 +1702,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID lpReserved)
         break;
 
     case DLL_PROCESS_DETACH:
-        if (lpReserved == nullptr)
-        {
-            Overlay_Shutdown();
-        }
+        PerformGracefulShutdown(lpReserved ? "DLL_PROCESS_DETACH (terminating)" : "DLL_PROCESS_DETACH (unload)");
         break;
     }
     return TRUE;

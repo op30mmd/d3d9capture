@@ -99,3 +99,13 @@ int  Capture_GetDumpQuota();
  * signal a worker thread if you need to encode/write to disk.
  */
 void Capture_FrameReady(const FrameData& frame);
+
+// ── In-Memory Log Ring Buffer for In-Game Console ────────────────────────────
+struct LogEntry
+{
+    char text[512];
+};
+
+size_t Log_GetRecentEntries(LogEntry* outEntries, size_t maxCount);
+void   Log_ClearRecentEntries();
+void   Log_ClearLogFile();

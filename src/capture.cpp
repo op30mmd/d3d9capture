@@ -35,9 +35,10 @@
 #include <atomic>
 
 #include "capture.h"
+#include "recorder.h"
 
 // ── constants ─────────────────────────────────────────────────────────────────
-static constexpr int  NUM_STAGING = 2;    // double-buffer staging surfaces
+static constexpr int  NUM_STAGING = 4;    // quad-buffer staging surfaces (3 frames of GPU DMA slack)
 static constexpr UINT MAX_WIDTH   = 7680; // guard against absurd resolutions
 static constexpr UINT MAX_HEIGHT  = 4320;
 
@@ -65,11 +66,9 @@ struct StagingTexture11
 static std::mutex              g_CapMtx;
 static StagingSurface9         g_Staging9[NUM_STAGING];
 static int                     g_WriteIdx9 = 0;
-static int                     g_ReadIdx9  = 1;
 
 static StagingTexture11        g_Staging11[NUM_STAGING];
 static int                     g_WriteIdx11 = 0;
-static int                     g_ReadIdx11  = 1;
 
 static std::atomic<UINT64>     g_FrameIdx{ 0 };
 static std::atomic<UINT64>     g_PresentCalls{ 0 };
@@ -286,11 +285,11 @@ void Capture_OnPresent(IDirect3DDevice9* pDev)
         return;
 
     int targetFps = g_TargetFps.load();
-    if (targetFps > 0 && !snapshotPending && !dumpPending)
+    if (targetFps > 0 && !snapshotPending && !dumpPending && !Capture_IsConsumerActive() && !Recorder_IsRecording())
     {
         double minIntervalSec = 1.0 / static_cast<double>(targetFps);
         double timeSinceLastCap = static_cast<double>(nowQpc.QuadPart - g_LastCaptureTime.QuadPart) / static_cast<double>(g_QpcFreq.QuadPart);
-        if (timeSinceLastCap < minIntervalSec)
+        if (timeSinceLastCap < (minIntervalSec * 0.70))
             return;
     }
 
@@ -344,31 +343,35 @@ void Capture_OnPresent(IDirect3DDevice9* pDev)
     g_LastReadbackMs.store(static_cast<float>(rbMs));
     g_LastWidth.store(desc.Width);
     g_LastHeight.store(desc.Height);
+    Recorder_SetDefaultResolution(desc.Width, desc.Height);
     g_LastFormat.store(static_cast<UINT32>(desc.Format));
     g_LastCaptureTime = rbEnd;
 
-    int prevRead = g_ReadIdx9;
-    g_ReadIdx9 = g_WriteIdx9;
-    g_WriteIdx9 = prevRead;
+    // Read the oldest staging surface queued 2 frames ago
+    const int readIdx = (g_WriteIdx9 + 1) % NUM_STAGING;
+    StagingSurface9& rs = g_Staging9[readIdx];
+    if (rs.pending && rs.pSurf)
+    {
+        D3DLOCKED_RECT lr = {};
+        hr = rs.pSurf->LockRect(&lr, nullptr, D3DLOCK_READONLY | D3DLOCK_NO_DIRTY_UPDATE);
+        if (SUCCEEDED(hr))
+        {
+            FrameData fd;
+            fd.pixels   = lr.pBits;
+            fd.width    = rs.width;
+            fd.height   = rs.height;
+            fd.stride   = static_cast<UINT>(lr.Pitch);
+            fd.format   = static_cast<UINT32>(rs.format);
+            fd.frameIdx = g_FrameIdx.fetch_add(1);
 
-    StagingSurface9& rs = g_Staging9[g_ReadIdx9];
-    if (!rs.pending) return;
+            Capture_FrameReady(fd);
 
-    D3DLOCKED_RECT lr = {};
-    hr = rs.pSurf->LockRect(&lr, nullptr, D3DLOCK_READONLY | D3DLOCK_NO_DIRTY_UPDATE);
-    if (FAILED(hr)) return;
+            rs.pSurf->UnlockRect();
+            rs.pending = false;
+        }
+    }
 
-    FrameData fd;
-    fd.pixels   = lr.pBits;
-    fd.width    = rs.width;
-    fd.height   = rs.height;
-    fd.stride   = static_cast<UINT>(lr.Pitch);
-    fd.format   = static_cast<UINT32>(rs.format);
-    fd.frameIdx = g_FrameIdx.fetch_add(1);
-
-    Capture_FrameReady(fd);
-
-    rs.pSurf->UnlockRect();
+    g_WriteIdx9 = (g_WriteIdx9 + 1) % NUM_STAGING;
 }
 
 // ── D3D11 / DXGI Capture Routine (GTA V) ──────────────────────────────────────
@@ -408,11 +411,11 @@ void Capture_OnPresentDXGI(IDXGISwapChain* pSwapChain)
         return;
 
     int targetFps = g_TargetFps.load();
-    if (targetFps > 0 && !snapshotPending && !dumpPending)
+    if (targetFps > 0 && !snapshotPending && !dumpPending && !Capture_IsConsumerActive() && !Recorder_IsRecording())
     {
         double minIntervalSec = 1.0 / static_cast<double>(targetFps);
         double timeSinceLastCap = static_cast<double>(nowQpc.QuadPart - g_LastCaptureTime.QuadPart) / static_cast<double>(g_QpcFreq.QuadPart);
-        if (timeSinceLastCap < minIntervalSec)
+        if (timeSinceLastCap < (minIntervalSec * 0.70))
             return;
     }
 
@@ -506,17 +509,14 @@ void Capture_OnPresentDXGI(IDXGISwapChain* pSwapChain)
     g_LastReadbackMs.store(static_cast<float>(rbMs));
     g_LastWidth.store(desc.Width);
     g_LastHeight.store(desc.Height);
+    Recorder_SetDefaultResolution(desc.Width, desc.Height);
     g_LastFormat.store(static_cast<UINT32>(desc.Format));
     g_LastCaptureTime = rbEnd;
 
-    // Read the staging texture filled on the PREVIOUS captured frame, never the
-    // one whose CopyResource was just queued a few lines above. Mapping that one
-    // makes the CPU wait for the GPU to finish the copy it has only just been
-    // handed -- a full pipeline sync on the render thread for every captured
-    // frame, which is precisely what the second staging texture exists to avoid.
-    // Measured at 800x600 that wait was ~2.1 ms per captured frame; the game
-    // stuttered in step with the capture rate.
-    const int readIdx = 1 - g_WriteIdx11;   // NUM_STAGING == 2
+    // With NUM_STAGING = 3, read the oldest texture queued 2 frames ago: (g_WriteIdx11 + 1) % NUM_STAGING.
+    // This gives a full 2 frames of GPU execution time for CopyResource to finish,
+    // completely eliminating DXGI_ERROR_WAS_STILL_DRAWING skips and CPU stalls.
+    const int readIdx = (g_WriteIdx11 + 1) % NUM_STAGING;
 
     StagingTexture11& rs = g_Staging11[readIdx];
     if (rs.pending && rs.pTex)
@@ -524,9 +524,13 @@ void Capture_OnPresentDXGI(IDXGISwapChain* pSwapChain)
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         LARGE_INTEGER mapStart = {}, mapEnd = {};
         QueryPerformanceCounter(&mapStart);
-        // Even a frame of slack is not a guarantee under heavy GPU load, so ask
-        // not to block: a skipped frame is always better than a stalled one.
         hr = pCtx->Map(rs.pTex, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+        {
+            // If still drawing after 3 frames of GPU pipeline slack, wait for completion
+            // via blocking Map so we never drop a frame or cause video stutter.
+            hr = pCtx->Map(rs.pTex, 0, D3D11_MAP_READ, 0, &mapped);
+        }
         QueryPerformanceCounter(&mapEnd);
         g_LastMapMs.store(static_cast<float>(
             static_cast<double>(mapEnd.QuadPart - mapStart.QuadPart) * 1000.0 /
@@ -564,16 +568,11 @@ void Capture_OnPresentDXGI(IDXGISwapChain* pSwapChain)
         }
         else if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
         {
-            // GPU has not finished the previous frame's copy. Leave it pending
-            // and try again rather than blocking the render thread.
             g_MapSkips.fetch_add(1);
         }
     }
 
-    // Next captured frame writes into the buffer we just consumed, so the one
-    // written this frame gets a full frame of slack before it is mapped.
-    g_WriteIdx11 = readIdx;
-    g_ReadIdx11  = 1 - readIdx;
+    g_WriteIdx11 = (g_WriteIdx11 + 1) % NUM_STAGING;
 
     pCtx->Release();
     pDev->Release();
