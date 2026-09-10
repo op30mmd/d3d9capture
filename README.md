@@ -225,6 +225,23 @@ and capturing them handed the consumer a back buffer that was never presented
 ### 2. D3D11 Staging Readback
 Inside `IDXGISwapChain::Present`, the backbuffer texture is retrieved. If multisampled, it is resolved via `ResolveSubresource`. Double-buffered staging textures (`D3D11_USAGE_STAGING`, `D3D11_CPU_ACCESS_READ`) perform GPU->CPU DMA readbacks via `CopyResource` and map memory for zero-copy delivery.
 
+### 2b. Why the readback does not stall the render thread
+`CopyResource` only *queues* the GPU->CPU copy. Mapping the texture it was just
+issued into makes the CPU wait for the GPU to finish it, which is a full
+pipeline sync on the render thread for every captured frame -- measured at
+2.1 ms per frame, and felt as a stutter in step with the capture rate.
+
+So the readback always maps the staging texture filled on the **previous**
+captured frame, giving the copy a whole frame to retire, and maps with
+`D3D11_MAP_FLAG_DO_NOT_WAIT` so that under heavy GPU load a frame is skipped
+rather than the render thread stalled. This is what the second staging texture
+is for; the buffers alone do nothing if the wrong one is mapped.
+
+The heartbeat reports `copy=`, `map=` and `hook=` separately for this reason.
+`copy` is near zero by design -- it is just the enqueue. `map` is the GPU wait
+and `hook` is the total time taken from the render thread; those are the numbers
+to watch. `skips=` counts frames dropped instead of stalling.
+
 ### 3. Recorder Threading Model
 One worker thread lives for as long as the recorder is initialised. `Recorder_Start`
 and `Recorder_Stop` never create or join threads — they push `BeginSession` /
