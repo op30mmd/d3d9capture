@@ -15,6 +15,15 @@
 
 setlocal
 
+:: vcvars*.bat exports VSCMD_ARG_TGT_ARCH (x86 / x64).  Say which one we are
+:: about to build, because a DLL of the wrong bitness injects with nothing but
+:: "LoadLibraryA returned 0" (GTA SA / GTA IV need x86, GTA V needs x64).
+if defined VSCMD_ARG_TGT_ARCH (
+    echo Target architecture: %VSCMD_ARG_TGT_ARCH%  ^(x86 = 32-bit games such as GTA IV / GTA SA, x64 = GTA V^)
+) else (
+    echo WARNING: no MSVC developer environment detected.  Run vcvars32.bat or vcvars64.bat first.
+)
+
 set OUTDIR=..\bin
 if not exist %OUTDIR% mkdir %OUTDIR%
 
@@ -44,7 +53,7 @@ if errorlevel 1 goto fail
 
 echo.
 echo ============================================================
-echo  Build succeeded.  Outputs in %OUTDIR%
+echo  Build succeeded.  Outputs in %OUTDIR%  (%VSCMD_ARG_TGT_ARCH%)
 echo.
 echo  Usage:
 echo    1. Run shm_reader.exe  (opens the shared-memory channel)

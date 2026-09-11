@@ -4,6 +4,7 @@
  * Hook chain (no D3D/DXGI object is constructed by this DLL):
  *
  *   application's Direct3DCreate9/Ex, D3D11CreateDeviceAndSwapChain, or CreateDXGIFactory import slots
+ *   (or its GetProcAddress slot, for exes that resolve those at runtime, e.g. GTA San Andreas)
  *        │                                          patched in the PE IAT
  *        ▼
  *   IDirect3D9::CreateDevice (slot 16), IDXGIFactory::CreateSwapChain (slot 10)
@@ -1166,6 +1167,83 @@ static HRESULT WINAPI Hooked_DirectInput8Create(
     return hr;
 }
 
+// ── GetProcAddress hook: runtime-resolved factory imports ─────────────────────
+// Some executables never list d3d9.dll / dinput8.dll in their import directory
+// and resolve those entry points at runtime instead.  The HOODLUM-cracked GTA
+// San Andreas exe is one: its only static imports are kernel32/user32/etc., and
+// its stub LoadLibrary()s d3d9.dll and GetProcAddress()es Direct3DCreate9 just
+// before RenderWare starts.  The IAT patch above therefore finds nothing to
+// hook, and without this the DLL is left with the memory-scan fallback.
+//
+// Patching the executable's own GetProcAddress import slot closes that gap:
+// when the game asks a Direct3D / DXGI / DirectInput runtime for one of the
+// factory functions we already hook, hand back the hook and remember the real
+// export as the trampoline, exactly as the IAT patch would have.  Only the main
+// executable's slot is patched; system DLLs call GetProcAddress constantly and
+// none of them is the party creating the game's device.
+typedef FARPROC (WINAPI *PFN_GetProcAddress)(HMODULE, LPCSTR);
+static PFN_GetProcAddress g_OrigGetProcAddress = nullptr;
+
+static bool ModuleBaseNameIs(HMODULE module, const char* name)
+{
+    char path[MAX_PATH] = {};
+    if (!GetModuleFileNameA(module, path, MAX_PATH)) return false;
+    const char* base = strrchr(path, '\\');
+    base = base ? base + 1 : path;
+    return _stricmp(base, name) == 0;
+}
+
+// Map (runtime module, export name) to our hook and its trampoline slot.
+// Returns nullptr when this export is not one we intercept.
+static void* DynamicFactoryHookFor(HMODULE module, const char* name, void*** outOriginalSlot)
+{
+    struct Entry { const char* dll; const char* name; void* hook; void** original; };
+    static const Entry kEntries[] = {
+        { "d3d9.dll",    "Direct3DCreate9",               reinterpret_cast<void*>(Hooked_Direct3DCreate9),               reinterpret_cast<void**>(&g_OrigDirect3DCreate9) },
+        { "d3d9.dll",    "Direct3DCreate9Ex",             reinterpret_cast<void*>(Hooked_Direct3DCreate9Ex),             reinterpret_cast<void**>(&g_OrigDirect3DCreate9Ex) },
+        { "d3d11.dll",   "D3D11CreateDevice",             reinterpret_cast<void*>(Hooked_D3D11CreateDevice),             reinterpret_cast<void**>(&g_OrigD3D11CreateDevice) },
+        { "d3d11.dll",   "D3D11CreateDeviceAndSwapChain", reinterpret_cast<void*>(Hooked_D3D11CreateDeviceAndSwapChain), reinterpret_cast<void**>(&g_OrigD3D11CreateDeviceAndSwapChain) },
+        { "dxgi.dll",    "CreateDXGIFactory",             reinterpret_cast<void*>(Hooked_CreateDXGIFactory),             reinterpret_cast<void**>(&g_OrigCreateDXGIFactory) },
+        { "dxgi.dll",    "CreateDXGIFactory1",            reinterpret_cast<void*>(Hooked_CreateDXGIFactory1),            reinterpret_cast<void**>(&g_OrigCreateDXGIFactory1) },
+        { "dxgi.dll",    "CreateDXGIFactory2",            reinterpret_cast<void*>(Hooked_CreateDXGIFactory2),            reinterpret_cast<void**>(&g_OrigCreateDXGIFactory2) },
+        { "dinput8.dll", "DirectInput8Create",            reinterpret_cast<void*>(Hooked_DirectInput8Create),            reinterpret_cast<void**>(&g_OrigDirectInput8Create) },
+    };
+
+    // Cheap name test first: this runs on every GetProcAddress the game makes.
+    for (const Entry& e : kEntries)
+    {
+        if (strcmp(name, e.name) != 0) continue;
+        if (!ModuleBaseNameIs(module, e.dll)) return nullptr;
+        *outOriginalSlot = e.original;
+        return e.hook;
+    }
+    return nullptr;
+}
+
+static FARPROC WINAPI Hooked_GetProcAddress(HMODULE module, LPCSTR name)
+{
+    PFN_GetProcAddress original = g_OrigGetProcAddress;
+    if (!original) return nullptr;
+
+    FARPROC real = original(module, name);
+    // Ordinal lookups (the pointer value is a 16-bit ordinal) carry no name;
+    // nothing we hook is imported that way, and strcmp on it would fault.
+    if (!real || !name || (reinterpret_cast<ULONG_PTR>(name) >> 16) == 0) return real;
+
+    void** originalSlot = nullptr;
+    void* hook = DynamicFactoryHookFor(module, name, &originalSlot);
+    if (!hook) return real;
+
+    // The IAT patch may already have recorded the same export; keep it.  Never
+    // record our own hook as the trampoline if the game re-resolves it later.
+    if (*originalSlot == nullptr && reinterpret_cast<void*>(real) != hook)
+        *originalSlot = reinterpret_cast<void*>(real);
+
+    Log("[hook] GetProcAddress(%p, \"%s\") -> %p redirected to hook %p (runtime-resolved import)",
+        module, name, reinterpret_cast<void*>(real), hook);
+    return reinterpret_cast<FARPROC>(hook);
+}
+
 static bool IsD3D9Import(const char* moduleName)
 {
     return moduleName && (_stricmp(moduleName, "d3d9.dll") == 0 ||
@@ -1204,6 +1282,8 @@ static void PatchModuleImports(HMODULE module)
         Log("[hook] Skipping runtime's own import table: %p (%s)", module, moduleName);
         return;
     }
+
+    const bool isExecutable = module == GetModuleHandleA(nullptr);
 
     auto base = reinterpret_cast<unsigned char*>(module);
     auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
@@ -1302,6 +1382,14 @@ static void PatchModuleImports(HMODULE module)
                 {
                     replacement = reinterpret_cast<void*>(Hooked_TerminateProcess);
                     original = reinterpret_cast<void**>(&g_OrigTerminateProcess);
+                }
+                else if (isExecutable &&
+                         strcmp(reinterpret_cast<const char*>(import->Name), "GetProcAddress") == 0)
+                {
+                    // Main executable only: catches factory imports the exe
+                    // resolves at runtime instead of through its IAT (GTA SA).
+                    replacement = reinterpret_cast<void*>(Hooked_GetProcAddress);
+                    original = reinterpret_cast<void**>(&g_OrigGetProcAddress);
                 }
             }
             if (replacement)

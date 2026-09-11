@@ -66,6 +66,56 @@ struct TrackedAudioClient
     ClientAudioFormat format;
 };
 
+// ── Level measurement ────────────────────────────────────────────────────────
+// The peak meter and the "is this stream audible" gate must ignore content no
+// speaker can reproduce.  GTA San Andreas is the case that forced this: with
+// nothing playing, its DirectSound->WASAPI 3D mixer idles with a ~5 Hz,
+// -38 dBFS wander on the centre and rear channels (front L/R stay at exactly
+// zero), slowly modulated over ~8 s.  A plain max(|x|) reads that as a level
+// bouncing between -60 and -38 dBFS, so the overlay's waveform bounced with it.
+//
+// Every level measurement therefore runs through two cascaded one-pole
+// high-pass stages (12 dB/oct, -3 dB at 30 Hz) with independent state per
+// channel.  Measured against the captured wander that takes it from -38 to
+// -85 dBFS, well under the -70 dBFS audibility gate, while a 60 Hz tone reads
+// ~2 dB low and 100 Hz under 1 dB.  DC is removed entirely.
+static constexpr uint32_t LEVEL_FILTER_CHANNELS = 8;
+static constexpr float    LEVEL_FILTER_CUTOFF_HZ = 30.0f;
+
+struct LevelFilter
+{
+    float x1[2][LEVEL_FILTER_CHANNELS] = {};
+    float y1[2][LEVEL_FILTER_CHANNELS] = {};
+};
+
+static inline float LevelFilterStep(LevelFilter* f, uint32_t ch, float x, float r)
+{
+    // Channels past what the state covers (unusual layouts) are measured raw
+    // rather than sharing state with another channel.
+    if (!f || ch >= LEVEL_FILTER_CHANNELS) return x;
+
+    float y = x - f->x1[0][ch] + r * f->y1[0][ch];
+    f->x1[0][ch] = x;
+    f->y1[0][ch] = y;
+
+    float y2 = y - f->x1[1][ch] + r * f->y1[1][ch];
+    f->x1[1][ch] = y;
+    f->y1[1][ch] = y2;
+
+    // The recursive terms decay towards zero during silence; flush them before
+    // they reach the denormal range, where x87/SSE arithmetic gets very slow
+    // on the game's audio thread.
+    if (fabsf(f->y1[0][ch]) < 1e-20f) f->y1[0][ch] = 0.0f;
+    if (fabsf(f->y1[1][ch]) < 1e-20f) f->y1[1][ch] = 0.0f;
+    return y2;
+}
+
+static inline float LevelFilterCoefficient(uint32_t sampleRate)
+{
+    const float fs = sampleRate ? static_cast<float>(sampleRate) : 48000.0f;
+    return 1.0f - 2.0f * 3.14159265f * LEVEL_FILTER_CUTOFF_HZ / fs;
+}
+
 struct TrackedRenderClient
 {
     IAudioRenderClient* renderClient = nullptr;
@@ -77,6 +127,7 @@ struct TrackedRenderClient
     DWORD               lastAudibleTick = 0;
     float               lastPeak = 0.0f;
     bool                isAudible = false;
+    LevelFilter         levelFilter;   // touched only by this client's audio thread
 };
 
 static constexpr size_t MAX_TRACKED = 16;
@@ -291,6 +342,7 @@ static void RegisterRenderClient(IAudioRenderClient* renderClient, IAudioClient*
     entry->lastAudibleTick = 0;
     entry->lastPeak        = 0.0f;
     entry->isAudible       = false;
+    entry->levelFilter     = LevelFilter{};
 
     // Evaluate master client candidacy:
     // Game master audio has >= 2 channels and >= 32000 Hz
@@ -537,12 +589,17 @@ static void ConvertToStereo16(
     }
 }
 
+// Peak of one buffer as heard: every sample goes through the high-pass in
+// `filter` (see LevelFilter) before the max is taken, so DC and sub-audible
+// wander never register.  `filter` may be null for a raw measurement.
 static bool CheckBufferAudible(
     const BYTE* pData,
     UINT32 numFrames,
     uint32_t channels,
     uint32_t bitsPerSample,
     bool isFloat,
+    uint32_t sampleRate,
+    LevelFilter* filter,
     float* outPeak)
 {
     if (!pData || numFrames == 0 || channels == 0)
@@ -551,43 +608,44 @@ static bool CheckBufferAudible(
         return false;
     }
 
+    const float r = LevelFilterCoefficient(sampleRate);
     float maxVal = 0.0f;
 
     if (isFloat && bitsPerSample == 32)
     {
         const float* f = reinterpret_cast<const float*>(pData);
-        const uint32_t total = numFrames * channels;
-        for (uint32_t i = 0; i < total; ++i)
-        {
-            float v = fabsf(f[i]);
-            if (v > maxVal) maxVal = v;
-        }
+        for (uint32_t i = 0; i < numFrames; ++i)
+            for (uint32_t ch = 0; ch < channels; ++ch)
+            {
+                float v = fabsf(LevelFilterStep(filter, ch, f[i * channels + ch], r));
+                if (v > maxVal) maxVal = v;
+            }
     }
     else if (!isFloat && bitsPerSample == 32)
     {
         const int32_t* p = reinterpret_cast<const int32_t*>(pData);
-        const uint32_t total = numFrames * channels;
-        for (uint32_t i = 0; i < total; ++i)
-        {
-            int32_t v = p[i];
-            uint32_t absV = (v < 0) ? static_cast<uint32_t>(-v) : static_cast<uint32_t>(v);
-            float norm = static_cast<float>(absV) / 2147483648.0f;
-            if (norm > maxVal) maxVal = norm;
-        }
+        for (uint32_t i = 0; i < numFrames; ++i)
+            for (uint32_t ch = 0; ch < channels; ++ch)
+            {
+                float norm = static_cast<float>(p[i * channels + ch]) / 2147483648.0f;
+                float v = fabsf(LevelFilterStep(filter, ch, norm, r));
+                if (v > maxVal) maxVal = v;
+            }
     }
     else if (!isFloat && bitsPerSample == 16)
     {
         const int16_t* p = reinterpret_cast<const int16_t*>(pData);
-        const uint32_t total = numFrames * channels;
-        for (uint32_t i = 0; i < total; ++i)
-        {
-            int16_t v = p[i];
-            uint16_t absV = (v < 0) ? static_cast<uint16_t>(-v) : static_cast<uint16_t>(v);
-            float norm = static_cast<float>(absV) / 32768.0f;
-            if (norm > maxVal) maxVal = norm;
-        }
+        for (uint32_t i = 0; i < numFrames; ++i)
+            for (uint32_t ch = 0; ch < channels; ++ch)
+            {
+                float norm = static_cast<float>(p[i * channels + ch]) / 32768.0f;
+                float v = fabsf(LevelFilterStep(filter, ch, norm, r));
+                if (v > maxVal) maxVal = v;
+            }
     }
 
+    // The high-pass can overshoot full scale by a fraction of a dB near Nyquist.
+    if (maxVal > 1.0f) maxVal = 1.0f;
     if (outPeak) *outPeak = maxVal;
     // Considered audible if peak exceeds ~ -70 dBFS (0.0003f)
     return (maxVal > 0.0003f);
@@ -671,6 +729,7 @@ static HRESULT WINAPI Hooked_ReleaseBuffer(
     const DWORD now = GetTickCount();
     ClientAudioFormat fmt;
     BYTE* pData = nullptr;
+    LevelFilter* levelFilter = nullptr;   // entries are static, so the pointer outlives the lock
 
     {
         std::lock_guard<std::mutex> lk(s_ClientTrackingMtx);
@@ -690,6 +749,7 @@ static HRESULT WINAPI Hooked_ReleaseBuffer(
                     s_RenderClients[i].lastAudibleTick = 0;
                     s_RenderClients[i].lastPeak        = 0.0f;
                     s_RenderClients[i].isAudible       = false;
+                    s_RenderClients[i].levelFilter     = LevelFilter{};
                     trc = &s_RenderClients[i];
                     break;
                 }
@@ -702,6 +762,7 @@ static HRESULT WINAPI Hooked_ReleaseBuffer(
             fmt = trc->format;
             pData = trc->lastBuffer ? trc->lastBuffer : ((t_LastClient == This) ? t_LastBuffer : nullptr);
             trc->lastBuffer = nullptr;
+            levelFilter = &trc->levelFilter;
         }
         else
         {
@@ -731,7 +792,10 @@ static HRESULT WINAPI Hooked_ReleaseBuffer(
 
     const bool isSilentFlag = (dwFlags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
     float bufferPeak = 0.0f;
-    const bool isAudible = (!isSilentFlag && pData) ? CheckBufferAudible(pData, NumFramesWritten, fmt.channels, fmt.bitsPerSample, fmt.isFloat, &bufferPeak) : false;
+    const bool isAudible = (!isSilentFlag && pData)
+        ? CheckBufferAudible(pData, NumFramesWritten, fmt.channels, fmt.bitsPerSample, fmt.isFloat,
+                             fmt.sampleRate, levelFilter, &bufferPeak)
+        : false;
 
     const float gain = s_SoftwareGain.load(std::memory_order_relaxed);
 
@@ -1276,19 +1340,19 @@ uint32_t Audio_ReadStereo16(int16_t* dst, uint32_t maxFrames, uint64_t* outQpc)
         }
     }
 
-    // Compute peak dBFS
-    int16_t maxSample = 0;
-    for (uint32_t i = 0; i < framesToRead * 2; ++i)
-    {
-        int16_t v = dst[i];
-        int16_t absV = (v == -32768) ? 32767 : (v < 0 ? -v : v);
-        if (absV > maxSample) maxSample = absV;
-    }
+    // Peak dBFS of what the encoder receives, through the same high-pass as
+    // the hook path (the downmix folds the centre/rear wander into L/R, so an
+    // unfiltered reading here would bounce exactly like the hook's did).
+    // Consumer thread only, so one static filter is enough.
+    static LevelFilter s_ReadLevelFilter;
+    float peak = 0.0f;
+    const bool audible = gain > 0.0001f &&
+        CheckBufferAudible(reinterpret_cast<const BYTE*>(dst), framesToRead, 2, 16, false,
+                           slot.sampleRate, &s_ReadLevelFilter, &peak);
     float peakDb = -96.0f;
-    if (maxSample > 0 && gain > 0.0001f)
+    if (audible)
     {
-        float norm = static_cast<float>(maxSample) / 32767.0f;
-        peakDb = 20.0f * log10f(norm);
+        peakDb = 20.0f * log10f(peak);
         if (peakDb > 0.0f) peakDb = 0.0f;
         s_LastAudibleHookTick.store(GetTickCount(), std::memory_order_relaxed);
     }

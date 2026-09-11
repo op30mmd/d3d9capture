@@ -12,8 +12,11 @@
  * Notes:
  *  – Must be run as administrator (or with SeDebugPrivilege) to open game
  *    processes.
- *  – The injector and the target MUST have the same bitness (both 32-bit or
- *    both 64-bit).  Most D3D9 games are 32-bit; build accordingly.
+ *  – The injector, the DLL and the target MUST all have the same bitness
+ *    (all 32-bit or all 64-bit).  Most D3D9 games (GTA IV, GTA San Andreas)
+ *    are 32-bit; GTA V is 64-bit.  Build accordingly.  The injector checks
+ *    all three before it touches the game and names the mismatch, because a
+ *    wrong-bitness LoadLibraryA simply returns NULL with no other clue.
  *  – Anticheat software may detect this technique.  For protected games use a
  *    kernel-level or driver-based injector instead.
  */
@@ -86,7 +89,11 @@ static int FindPidsByName(const char* name, DWORD* out, int maxOut)
  */
 static bool ProcessHasRenderer(DWORD pid)
 {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    // TH32CS_SNAPMODULE32 lets a 64-bit injector see a 32-bit (WOW64) process;
+    // without it the snapshot fails with ERROR_PARTIAL_COPY and the game is
+    // never recognised as a renderer.  The bitness check in Inject() still
+    // refuses such a target with a clear message.
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
     if (snap == INVALID_HANDLE_VALUE) return false;  // starting up, or no access
 
     MODULEENTRY32 me = { sizeof(me) };
@@ -129,6 +136,109 @@ static bool EnableDebugPrivilege()
     return GetLastError() == ERROR_SUCCESS;
 }
 
+// ── bitness checks ────────────────────────────────────────────────────────────
+// A DLL can only be loaded into a process of the same bitness, and
+// CreateRemoteThread with our own LoadLibraryA address only makes sense when
+// the target maps the same kernel32 we do.  Injecting a 64-bit build into a
+// 32-bit game (GTA San Andreas, GTA IV) or vice versa fails with a bare
+// "LoadLibraryA returned 0", so every path resolves the three bitnesses first
+// and refuses with a message that says which one is wrong.
+enum class Arch { Unknown, X86, X64 };
+
+static const char* ArchName(Arch a)
+{
+    switch (a)
+    {
+    case Arch::X86: return "32-bit (x86)";
+    case Arch::X64: return "64-bit (x64)";
+    default:        return "unknown";
+    }
+}
+
+static Arch SelfArch()
+{
+    return sizeof(void*) == 8 ? Arch::X64 : Arch::X86;
+}
+
+// Bitness of an EXE or DLL on disk, from IMAGE_FILE_HEADER.Machine.
+static Arch PeFileArch(const char* path)
+{
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return Arch::Unknown;
+
+    Arch arch = Arch::Unknown;
+    IMAGE_DOS_HEADER dos = {};
+    DWORD read = 0;
+    if (ReadFile(h, &dos, sizeof(dos), &read, nullptr) && read == sizeof(dos) &&
+        dos.e_magic == IMAGE_DOS_SIGNATURE &&
+        SetFilePointer(h, dos.e_lfanew, nullptr, FILE_BEGIN) != INVALID_SET_FILE_POINTER)
+    {
+        DWORD signature = 0;
+        IMAGE_FILE_HEADER fh = {};
+        if (ReadFile(h, &signature, sizeof(signature), &read, nullptr) && read == sizeof(signature) &&
+            signature == IMAGE_NT_SIGNATURE &&
+            ReadFile(h, &fh, sizeof(fh), &read, nullptr) && read == sizeof(fh))
+        {
+            if (fh.Machine == IMAGE_FILE_MACHINE_I386) arch = Arch::X86;
+            else if (fh.Machine == IMAGE_FILE_MACHINE_AMD64) arch = Arch::X64;
+        }
+    }
+    CloseHandle(h);
+    return arch;
+}
+
+// Bitness of a live process.  Works on a CREATE_SUSPENDED process too, since
+// WOW64 status is fixed at creation.
+static Arch ProcessArch(HANDLE hProc)
+{
+    BOOL wow64 = FALSE;
+    if (!IsWow64Process(hProc, &wow64)) return Arch::Unknown;
+    if (wow64) return Arch::X86;
+
+    SYSTEM_INFO si = {};
+    GetNativeSystemInfo(&si);
+    return si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL ? Arch::X86 : Arch::X64;
+}
+
+// Print the mismatch and how to fix it.  `targetLabel` names the game
+// (an exe path or "PID 1234").
+static void ReportBitnessMismatch(const char* targetLabel, Arch target,
+                                  const char* dllPath, Arch dll)
+{
+    const Arch self = SelfArch();
+    const char* want = target == Arch::X86 ? "x86" : "x64";
+
+    printf("[inject] ERROR: bitness mismatch.\n");
+    printf("         target   %-14s %s\n", ArchName(target), targetLabel);
+    printf("         dll      %-14s %s\n", ArchName(dll), dllPath);
+    printf("         injector %-14s (this inject_tool.exe)\n", ArchName(self));
+    printf("         A DLL can only be loaded into a process of the same bitness, and the\n"
+           "         injector must match the target too.  Use the %s build of both\n"
+           "         d3d9capture.dll and inject_tool.exe: run build.bat from a \"%s Native\n"
+           "         Tools\" developer prompt, or download the d3d9capture-%s release zip.\n",
+           want, want, want);
+}
+
+// Returns true when injector, DLL and target all share one bitness.
+static bool CheckBitness(const char* targetLabel, Arch target, const char* dllPath)
+{
+    const Arch dll  = PeFileArch(dllPath);
+    const Arch self = SelfArch();
+
+    if (target == Arch::Unknown)
+        printf("[inject] WARNING: could not determine the target's bitness; continuing.\n");
+    if (dll == Arch::Unknown)
+        printf("[inject] WARNING: %s is not a readable x86/x64 PE image; continuing.\n", dllPath);
+
+    const bool dllOk  = dll == Arch::Unknown || target == Arch::Unknown || dll == target;
+    const bool selfOk = target == Arch::Unknown || self == target;
+    if (dllOk && selfOk) return true;
+
+    ReportBitnessMismatch(targetLabel, target, dllPath, dll);
+    return false;
+}
+
 // ── injector core ─────────────────────────────────────────────────────────────
 /**
  * Classic CreateRemoteThread + LoadLibraryA injection.
@@ -152,6 +262,14 @@ static bool Inject(DWORD pid, const char* dllPath)
     if (!hProc)
     {
         printf("[inject] OpenProcess failed: %lu\n", GetLastError());
+        return false;
+    }
+
+    char pidLabel[32] = {};
+    _snprintf_s(pidLabel, sizeof(pidLabel), _TRUNCATE, "PID %lu", pid);
+    if (!CheckBitness(pidLabel, ProcessArch(hProc), dllPath))
+    {
+        CloseHandle(hProc);
         return false;
     }
 
@@ -255,6 +373,10 @@ int main(int argc, char* argv[])
         printf("  --wait-for start the game normally, then use this: it waits for a process\n");
         printf("             of that name which has actually loaded d3d9/d3d11/dxgi and\n");
         printf("             injects into that one, skipping launcher stubs.\n");
+        printf("\n");
+        printf("  This inject_tool.exe is %s.  The game, the DLL and the injector must\n", ArchName(SelfArch()));
+        printf("  all share one bitness: use the x86 build for 32-bit games (GTA IV, GTA SA)\n");
+        printf("  and the x64 build for 64-bit games (GTA V).\n");
         return 1;
     }
 
@@ -359,6 +481,16 @@ int main(int argc, char* argv[])
             printf("[inject] Could not resolve game path.\n");
             return 1;
         }
+        if (GetFileAttributesA(gamePath) == INVALID_FILE_ATTRIBUTES)
+        {
+            printf("[inject] Game executable not found: %s\n", gamePath);
+            return 1;
+        }
+
+        // Refuse a wrong-bitness build before the game is even created, so
+        // the user gets the diagnosis instead of a spawned-then-killed process.
+        if (!CheckBitness(gamePath, PeFileArch(gamePath), dllPath))
+            return 1;
 
         bool waitExit = false;
         char commandLine[8192] = {};
@@ -412,9 +544,12 @@ int main(int argc, char* argv[])
         if (!injected)
         {
             printf("[inject] Injection failed; terminating suspended process.\n");
-            printf("[inject] HINT: if this game exe is a launcher stub that re-executes\n"
-                   "               the real renderer (GTA V does this), --launch cannot work.\n"
-                   "               Start the game normally, then use:\n"
+            printf("[inject] HINT: LoadLibraryA returning 0 usually means the DLL's own\n"
+                   "               dependencies are missing in the game (e.g. the Visual C++\n"
+                   "               runtime for the DLL's bitness) or its DllMain failed.\n"
+                   "               If this game exe is a launcher stub that re-executes the\n"
+                   "               real renderer (GTA V does this), --launch cannot work:\n"
+                   "               start the game normally, then use:\n"
                    "                 inject_tool.exe --wait-for <renderer.exe> <dll>\n");
 
             CloseHandle(readyEvent);
