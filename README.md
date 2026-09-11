@@ -374,7 +374,40 @@ and capturing them handed the consumer a back buffer that was never presented
 
 ### Readback without stalling the render thread
 
-**D3D9**: `GetRenderTargetData` into a system-memory surface, then `LockRect`.
+**D3D9**: `GetRenderTargetData` is the only GPU→CPU path, and on the AMD
+driver it is synchronous: it returns only when the copy has landed in system
+memory. Reading the back buffer with it directly therefore waited for the GPU
+to finish the whole frame — measured on GTA SA at 1920x1080 as 3–17 ms per
+frame on the render thread, which cut the game from 60 to 37 fps while
+recording. D3D11 never had this problem because its staging texture is
+GPU-writable system memory: `CopyResource` is a queued DMA and `Map` just
+returns the pointer. D3D9 has no such surface, so the transfer is instead
+taken off the render thread altogether:
+
+| Step | Where | Call | Cost |
+|---|---|---|---|
+| 1 | render thread, in `Present` | `StretchRect` back buffer → default-pool render target (resolves MSAA too), then `Issue` an event query | ~0.005 ms |
+| 2 | readback worker | poll the query until the copy has retired, then `GetRenderTargetData` → system-memory surface | ~2–2.5 ms, off the render thread |
+| 3 | readback worker | `LockRect`, hand the frame to the recorder / shared memory, `UnlockRect` | ~2 ms, off the render thread |
+
+Step 2 needs the device to be thread-safe, so the `CreateDevice` hook adds
+`D3DCREATE_MULTITHREADED` to the game's behaviour flags (GTA SA creates its
+device without it). The runtime then takes a critical section around every
+call, which costs the game nothing measurable — but it also means that while
+the worker is inside `GetRenderTargetData` the render thread's next D3D call
+waits for it. That bound is the DMA time itself (~2 ms; more if the GPU is
+busy), so the worker path is never worse than doing the DMA on the render
+thread, and normally it is ~10x better. A device found by the fallback scan
+that lacks the flag falls back to an on-thread version of the same pipeline
+(DMA one present after the copy, lock only once the query says it is done).
+
+Same scene, recording at 60 fps: render-thread cost per present went from
+14–19 ms to **0.4 ms** (0.37 ms of it the overlay) and the game stays at 60 fps.
+Four slots rotate; a full ring skips the frame rather than waiting.
+`[cap9] heartbeat(worker|on-thread)` reports avg/max per stage every 5 s
+(`copy` on the render thread; `dma`, `lock`, `deliver` wherever they run; plus
+`overlay` and the game's own `Present` for scale) and counts `dma-not-ready`,
+`forced-locks` and `slots-full`.
 
 **D3D11 / DXGI**: the back buffer is retrieved inside `IDXGISwapChain::Present`
 and resolved with `ResolveSubresource` if multisampled. `CopyResource` into a
@@ -388,7 +421,7 @@ heavy GPU load a frame is skipped rather than the render thread stalled. That
 is what the second staging texture is for.
 
 The `[cap11] heartbeat` log line reports `copy=`, `map=` and `hook=`
-separately for this reason: `copy` is near zero by design (it is just the
+separately for this reason (last-sample values, unlike the D3D9 heartbeat): `copy` is near zero by design (it is just the
 enqueue), `map` is the GPU wait, `hook` is the total time taken from the render
 thread, and `skips=` counts frames dropped instead of stalling.
 
@@ -609,7 +642,7 @@ scanning.
 |---|---|
 | `src/dllmain.cpp` | DLL entry point; patches the factory imports and the executable's `GetProcAddress`, installs the device / swap-chain hooks, runs the fallback scan, hooks process exit for auto-save |
 | `src/capture.h/cpp` | Double-buffered GPU readback via `GetRenderTargetData` (D3D9) and `CopyResource` (D3D11/DXGI); `DXGI_PRESENT_TEST` filtering; de-striding; calls `Recorder_SetDefaultResolution` on every present |
-| `src/consumer_backend.cpp` | Shared-memory publisher (`Local\D3D9CaptureShm` + events); screenshots and BMP debug dumps |
+| `src/consumer_backend.cpp` | Shared-memory publisher (`Local\D3D9CaptureShm` + events); screenshots and BMP debug dumps (`DUMP_FRAMES`, off by default: it writes 8 MB BMPs on the render thread) |
 | `src/recorder.h/cpp` | In-process H.264/AAC MP4 encoder: one long-lived worker draining a bounded queue of frames and session markers into an `IMFSinkWriter`; async pre-arm; auto-save on exit |
 | `src/audio.h/cpp` | In-process WASAPI capture: `IAudioRenderClient` hooks, per-client format tracking and master election, BS.775 downmix, QPC-stamped ring, loopback fallback, software gain, high-passed level metering |
 | `src/overlay.h/cpp` | ImGui control centre drawn inside the `Present` hook (D3D9 & D3D11 backends); tabs, mini-HUD, hotkeys, beacon |

@@ -428,6 +428,19 @@ static thread_local bool s_DeviceFrameRendered = false;
 static thread_local bool s_SwapChainFrameRendered = false;
 static thread_local bool s_DeviceExFrameRendered = false;
 
+// Feed the [cap9] heartbeat: capture / overlay / game-present split of one
+// hooked Present, in milliseconds.
+static void ReportPresentTiming9(const LARGE_INTEGER& t0, const LARGE_INTEGER& t1,
+                                 const LARGE_INTEGER& t2, const LARGE_INTEGER& t3)
+{
+    static LARGE_INTEGER freq = {};
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    const double k = 1000.0 / static_cast<double>(freq.QuadPart);
+    Capture_ReportPresentTiming9(static_cast<double>(t1.QuadPart - t0.QuadPart) * k,
+                                 static_cast<double>(t2.QuadPart - t1.QuadPart) * k,
+                                 static_cast<double>(t3.QuadPart - t2.QuadPart) * k);
+}
+
 static HRESULT WINAPI Hooked_Present(
     IDirect3DDevice9* pDev,
     const RECT* pSrc, const RECT* pDst, HWND hWnd, const RGNDATA* pDirty)
@@ -439,19 +452,26 @@ static HRESULT WINAPI Hooked_Present(
     static bool logged = false;
     if (!logged) { Log("[dll] Hooked_Present called (first time)"); logged = true; }
 
+    LARGE_INTEGER t0 = {}, t1 = {}, t2 = {}, t3 = {};
+    QueryPerformanceCounter(&t0);
+    t1 = t2 = t0;
     if (!s_DeviceFrameRendered && pDev)
     {
         Capture_OnPresent(pDev);
+        QueryPerformanceCounter(&t1);
         Overlay_OnPresent(pDev);
+        QueryPerformanceCounter(&t2);
         s_DeviceFrameRendered = true;
     }
 
     HRESULT hr = g_OrigPresent(pDev, pSrc, pDst, hWnd, pDirty);
+    QueryPerformanceCounter(&t3);
     if (hr != D3DERR_WASSTILLDRAWING)
     {
         s_DeviceFrameRendered = false;
     }
 
+    ReportPresentTiming9(t0, t1, t2, t3);
     g_InsidePresent = false;
     return hr;
 }
@@ -722,6 +742,15 @@ static HRESULT WINAPI Hooked_CreateDevice(
         Log("[hook] CreateDevice has no original trampoline");
         return D3DERR_INVALIDCALL;
     }
+    // Ask for a thread-safe device so the capture readback can run on a worker
+    // thread (capture.cpp). The runtime then takes a critical section around
+    // each call, which is cheap; without it the render thread would have to
+    // do the GPU->CPU transfer itself.
+    if (!(BehaviorFlags & D3DCREATE_MULTITHREADED))
+    {
+        BehaviorFlags |= D3DCREATE_MULTITHREADED;
+        Log("[hook] CreateDevice: adding D3DCREATE_MULTITHREADED (flags now 0x%08lX)", BehaviorFlags);
+    }
     g_D3D9CallsInFlight.fetch_add(1);
     HRESULT hr = g_OrigCreateDevice(
         pD3D, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPP, ppDevice);
@@ -751,6 +780,11 @@ static HRESULT WINAPI Hooked_CreateDeviceEx(
     {
         Log("[hook] CreateDeviceEx has no original trampoline");
         return D3DERR_INVALIDCALL;
+    }
+    if (!(BehaviorFlags & D3DCREATE_MULTITHREADED))
+    {
+        BehaviorFlags |= D3DCREATE_MULTITHREADED;   // same reason as in Hooked_CreateDevice
+        Log("[hook] CreateDeviceEx: adding D3DCREATE_MULTITHREADED (flags now 0x%08lX)", BehaviorFlags);
     }
     g_D3D9CallsInFlight.fetch_add(1);
     HRESULT hr = g_OrigCreateDeviceEx(

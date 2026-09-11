@@ -33,7 +33,7 @@
 #include "audio.h"
 
 // ── tunables ──────────────────────────────────────────────────────────────────
-static constexpr int   DUMP_FRAMES       = 10;                  // 0 = disabled
+static constexpr int   DUMP_FRAMES       = 0;                   // 0 = disabled; >0 writes the first N frames as BMPs on the render thread (8 MB and ~12 ms each at 1080p), debugging only
 static constexpr DWORD SHM_MAX_BYTES     = 7680 * 4320 * 4 + 64; // 4K RGBA + header
 static constexpr char  SHM_NAME[]        = "Local\\D3D9CaptureShm";
 static constexpr char  EVT_FRAME_READY[] = "Local\\D3D9CaptureReady";

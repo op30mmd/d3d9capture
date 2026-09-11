@@ -51,6 +51,12 @@ void Capture_ReleaseSurfaces();
  * render thread's.
  */
 bool Capture_WantsFrame();
+
+// D3D9 hook timing.  The Present hook reports how long each stage took on the
+// render thread; the capture path folds it into the [cap9] heartbeat as
+// avg/max over the heartbeat window, which is what an overhead investigation
+// needs (a last-sample figure hides the spikes).
+void Capture_ReportPresentTiming9(double captureMs, double overlayMs, double presentMs);
 bool Capture_IsConsumerActive();
 
 struct FrameData
